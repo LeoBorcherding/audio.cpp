@@ -454,6 +454,13 @@ jobs:
               $extra = @('--no-run')
             }
           }
+          # CUDA: load the runtime from the cudart companion zip, as Studio does, never from the
+          # toolkit on PATH (CUDA 13 keeps its DLLs in bin\x64, which PATH does not name).
+          if ('${{ matrix.accel }}' -like 'cuda*') {
+            $rt = Join-Path $env:RUNNER_TEMP 'cudart-smoke'
+            Expand-Archive -Force "dist/audio-${{ inputs.tag }}-cudart-windows-x64-${{ matrix.accel }}.zip" $rt
+            $extra += @('--lib-path', $rt)
+          }
           python tooling/scripts/unsloth/validate_bundle.py `
             --bundle "dist/audio-${{ inputs.tag }}-bin-windows-x64-${{ matrix.accel }}.zip" `
             --expect-backends '${{ matrix.expect }}' @extra
@@ -484,7 +491,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { arch: arm64, runner: macos-26,       metal: 'ON',  expect: 'cpu,metal', expect_arch: arm64 }
+          - { arch: arm64, runner: macos-15,       metal: 'ON',  expect: 'cpu,metal', expect_arch: arm64 }
           # Keeps the -metal name (the installer's parser and upstream's
           # naming), built with Metal off: Intel runners have no usable GPU and
           # Studio launches this slice on the CPU backend.

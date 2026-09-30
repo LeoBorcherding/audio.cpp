@@ -94,7 +94,7 @@ This is upstream's naming, which the Studio installer's resolver also reads.
 | `audio-<tag>-bin-windows-x64-cuda13.zip` | `windows-2022` | CUDA 13.0.2 (Jimver), `ggml-cuda.dll` | yes |
 | `audio-<tag>-cudart-windows-x64-cuda12.zip` | `windows-2022` | cudart64 / cublas64 / cublasLt64 / cufft64 of 12.8.1 | yes |
 | `audio-<tag>-cudart-windows-x64-cuda13.zip` | `windows-2022` | the same DLLs of 13.0.2 | yes |
-| `audio-<tag>-bin-macos-arm64-metal.tar.gz` | `macos-26` | Metal on, deployment target 13.3 | yes |
+| `audio-<tag>-bin-macos-arm64-metal.tar.gz` | `macos-15` | Metal on, deployment target 13.3 | yes |
 | `audio-<tag>-bin-macos-x64-metal.tar.gz` | `macos-15-intel` | Metal off (name kept; Studio runs it on CPU) | yes |
 
 Each release also carries `audio-cpp-prebuilt-manifest.json`,
