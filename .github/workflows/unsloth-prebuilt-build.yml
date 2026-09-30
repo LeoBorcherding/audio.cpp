@@ -1,0 +1,556 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+name: "Unsloth audio.cpp prebuilt: build"
+
+# Reusable child of unsloth-prebuilt.yml. Builds, packages and validates every
+# audiocpp_server bundle from the ONE stamped source tarball the orchestrator's
+# resolve job uploaded, so every bundle of a packaging tag comes from the same
+# upstream commit.
+#
+# audio.cpp vendors a patched ggml, so unlike whisper.cpp it cannot ride the
+# llama.cpp install's ggml: every bundle is self-contained (fat). All of them
+# link eSpeak-ng statically with espeak-ng-data.bin beside the server.
+#
+# Each job ends with scripts/unsloth/validate_bundle.py on its own runner:
+# layout + branding, dependency closure, and (wherever the runner can execute
+# the build) a real Kokoro TTS -> Moonshine STT round trip through the HTTP
+# server with the exact config Studio writes. CUDA bundles run that smoke on the
+# CPU backend: the Linux ones against the toolkit's libcuda stub (no GPU on a
+# hosted runner), the Windows ones because ggml-cuda.dll is a dlopen'd backend
+# that simply does not load without nvcuda.dll.
+
+on:
+  workflow_call:
+    inputs:
+      tag:             { required: true,  type: string }
+      upstream_tag:    { required: true,  type: string }
+      repo:            { required: false, type: string, default: 'unslothai/audio.cpp' }
+      commit:          { required: true,  type: string }
+      source_artifact: { required: true,  type: string }
+      espeak_commit:   { required: true,  type: string }
+      sign_windows:    { required: false, type: boolean, default: true }
+    secrets:
+      # Optional so a fork can still build; the composite action fails closed on
+      # unslothai itself. See .github/actions/sign-windows.
+      AZURE_CLIENT_ID:                     { required: false }
+      AZURE_CLIENT_SECRET:                 { required: false }
+      AZURE_TENANT_ID:                     { required: false }
+      AZURE_TRUSTED_SIGNING_ACCOUNT_NAME:  { required: false }
+      AZURE_CERTIFICATE_PROFILE_NAME:      { required: false }
+
+permissions:
+  contents: read
+
+env:
+  # CMAKE_CUDA_ARCHITECTURES. audio.cpp rewrites 12X to 12Xa (Blackwell
+  # arch-specific SASS), and arch-specific PTX cannot JIT on any other GPU, so
+  # the forward-compatible PTX is compute_100: sm_103/110/121 and future GPUs
+  # JIT from it. CUDA 13 dropped sm_50-72, so both lines share one list.
+  CUDA12_ARCHS: '75-real;80-real;86-real;89-real;90-real;100-real;120-real;100-virtual'
+  CUDA13_ARCHS: '75-real;80-real;86-real;89-real;90-real;100-real;120-real;100-virtual'
+  # Linux containers + Windows Jimver installs. 13.0 matches torch's cu130
+  # wheels, whose libcudart.so.13 / cudart64_13.dll Studio reuses.
+  CUDA12_TOOLKIT: '12.8.1'
+  CUDA13_TOOLKIT: '13.0.2'
+  VULKAN_VERSION: '1.4.357.0'
+  # Keep in step with HF_REVISION in scripts/unsloth/validate_bundle.py.
+  SMOKE_MODELS_KEY: 'audiocpp-smoke-models-83c5d96c03023ff5a7712570d057ce26c8769f98-v1'
+  PYTHONUNBUFFERED: '1'
+
+jobs:
+  linux:
+    name: ubuntu/${{ matrix.arch }}-${{ matrix.accel }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 150
+    continue-on-error: ${{ matrix.optional }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x64,   accel: cpu,          flavour: cpu,          runner: ubuntu-22.04,     expect: 'cpu',        optional: false }
+          - { arch: x64,   accel: cpu-portable, flavour: cpu-portable, runner: ubuntu-22.04,     expect: 'cpu',        optional: false }
+          - { arch: x64,   accel: vulkan,       flavour: vulkan,       runner: ubuntu-22.04,     expect: 'cpu,vulkan', optional: false }
+          # Best-effort, like whisper's old windows-arm64 leg: a failure here
+          # never blocks the release.
+          - { arch: arm64, accel: cpu,          flavour: cpu,          runner: ubuntu-22.04-arm, expect: 'cpu',        optional: true }
+    env:
+      CC: gcc-13
+      CXX: g++-13
+    steps:
+      - name: Checkout build tooling (this repo)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+        with: { path: tooling, persist-credentials: false }
+
+      - name: Download stamped source @ ${{ inputs.tag }}
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53  # v6.0.0
+        with: { name: "${{ inputs.source_artifact }}", path: srcpkg }
+
+      - name: Extract source
+        run: |
+          set -eux
+          mkdir -p src
+          tar -xzf "srcpkg/audio.cpp-source-${{ inputs.tag }}.tar.gz" -C src --strip-components=1
+          test "$(cat src/UNSLOTH_SOURCE_COMMIT)" = '${{ inputs.commit }}'
+
+      # ubuntu-22.04 keeps the glibc 2.35 floor; gcc-13 (toolchain PPA) is the
+      # language level audio.cpp needs, with the C++ runtime linked statically.
+      - name: Install toolchain
+        run: |
+          set -eux
+          sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
+          sudo apt-get update
+          sudo apt-get install -y gcc-13 g++-13 ninja-build binutils
+
+      - name: Install Vulkan SDK
+        if: matrix.flavour == 'vulkan'
+        run: |
+          set -eux
+          wget -qO - https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo apt-key add -
+          sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
+          sudo apt-get update
+          sudo apt-get install -y vulkan-sdk libvulkan1 mesa-vulkan-drivers
+
+      - name: Build
+        env:
+          AUDIOCPP_VERSION: ${{ inputs.tag }}
+        run: bash tooling/scripts/unsloth/build_unix.sh src build "${{ matrix.flavour }}"
+
+      - name: Package
+        run: |
+          set -eux
+          python3 tooling/scripts/unsloth/package_bundle.py \
+            --bin-dir build/bin --src-dir src --out-dir dist \
+            --tag '${{ inputs.tag }}' --upstream-tag '${{ inputs.upstream_tag }}' \
+            --commit '${{ inputs.commit }}' --source-repo '${{ inputs.repo }}' \
+            --os linux --arch '${{ matrix.arch }}' --accel '${{ matrix.accel }}' \
+            --min-os glibc-2.35 --espeak-commit '${{ inputs.espeak_commit }}'
+
+      - name: Cache smoke models
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with: { path: smoke-models, key: "${{ env.SMOKE_MODELS_KEY }}", enableCrossOsArchive: true }
+
+      - name: Validate (closure, glibc floor, Kokoro + Moonshine smoke)
+        run: |
+          set -eux
+          python3 tooling/scripts/unsloth/validate_bundle.py \
+            --bundle "dist/audio-${{ inputs.tag }}-bin-ubuntu-${{ matrix.arch }}-${{ matrix.accel }}.tar.gz" \
+            --expect-backends '${{ matrix.expect }}' --max-glibc 2.35 \
+            --smoke --backend cpu --models-dir smoke-models
+
+      - name: Upload bundle artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6.0.0
+        with:
+          name: audio-${{ inputs.tag }}-bin-ubuntu-${{ matrix.arch }}-${{ matrix.accel }}
+          path: dist/audio-${{ inputs.tag }}-bin-ubuntu-${{ matrix.arch }}-${{ matrix.accel }}.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  linux-cuda:
+    # Lean like unslothai/llama.cpp's Linux CUDA bundles: cudart, cuBLAS and
+    # cuFFT are linked dynamically and NOT shipped (Studio loads them from
+    # torch's nvidia-* wheels), NCCL is off. Built in NVIDIA's ubuntu22.04 devel
+    # image so the glibc floor stays 2.35.
+    name: ubuntu/x64-${{ matrix.accel }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
+    container: nvidia/cuda:${{ matrix.toolkit }}-devel-ubuntu22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { accel: cuda12, major: 12, toolkit: '12.8.1' }
+          - { accel: cuda13, major: 13, toolkit: '13.0.2' }
+    env:
+      CC: gcc-13
+      CXX: g++-13
+      CUDAHOSTCXX: g++-13
+    steps:
+      - name: Install toolchain
+        run: |
+          set -eux
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq software-properties-common ca-certificates
+          add-apt-repository -y ppa:ubuntu-toolchain-r/test
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq gcc-13 g++-13 ninja-build python3 python3-pip git binutils xz-utils zstd
+          # jammy's apt cmake (3.22) predates CUDA 13's toolkit layout; the
+          # upstream recipe is built with cmake 3.28+.
+          python3 -m pip install --no-cache-dir 'cmake>=3.28,<4'
+          hash -r
+          cmake --version
+
+      - name: Pin the matrix toolkit to the workflow env
+        run: |
+          set -eu
+          want='${{ matrix.accel == 'cuda12' && env.CUDA12_TOOLKIT || env.CUDA13_TOOLKIT }}'
+          [ "$want" = '${{ matrix.toolkit }}' ] || { echo "matrix toolkit ${{ matrix.toolkit }} != env $want" >&2; exit 1; }
+          nvcc --version | tail -2
+
+      - name: Checkout build tooling (this repo)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+        with: { path: tooling, persist-credentials: false }
+
+      - name: Download stamped source @ ${{ inputs.tag }}
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53  # v6.0.0
+        with: { name: "${{ inputs.source_artifact }}", path: srcpkg }
+
+      - name: Extract source
+        run: |
+          set -eux
+          mkdir -p src
+          tar -xzf "srcpkg/audio.cpp-source-${{ inputs.tag }}.tar.gz" -C src --strip-components=1
+          test "$(cat src/UNSLOTH_SOURCE_COMMIT)" = '${{ inputs.commit }}'
+
+      - name: Build
+        env:
+          AUDIOCPP_VERSION: ${{ inputs.tag }}
+          CUDA_ARCHS: ${{ matrix.accel == 'cuda12' && env.CUDA12_ARCHS || env.CUDA13_ARCHS }}
+        run: bash tooling/scripts/unsloth/build_unix.sh src build cuda
+
+      - name: Package
+        env:
+          CUDA_ARCHS: ${{ matrix.accel == 'cuda12' && env.CUDA12_ARCHS || env.CUDA13_ARCHS }}
+        run: |
+          set -eux
+          python3 tooling/scripts/unsloth/package_bundle.py \
+            --bin-dir build/bin --src-dir src --out-dir dist \
+            --tag '${{ inputs.tag }}' --upstream-tag '${{ inputs.upstream_tag }}' \
+            --commit '${{ inputs.commit }}' --source-repo '${{ inputs.repo }}' \
+            --os linux --arch x64 --accel '${{ matrix.accel }}' \
+            --runtime-line '${{ matrix.accel }}' --cuda-toolkit '${{ matrix.toolkit }}' --sms "$CUDA_ARCHS" \
+            --min-os glibc-2.35 --espeak-commit '${{ inputs.espeak_commit }}' --no-run
+
+      - name: Cache smoke models
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with: { path: smoke-models, key: "${{ env.SMOKE_MODELS_KEY }}", enableCrossOsArchive: true }
+
+      # No GPU here: libcuda.so.1 is the toolkit's stub, so CUDA init fails
+      # cleanly and the smoke runs the same binary on the CPU backend. The lean
+      # contract (no cudart/cuBLAS/cuFFT/NCCL inside, none but the line's
+      # runtime + libcuda unresolved, no NCCL NEEDED) is checked either way.
+      - name: Validate (lean closure, glibc floor, CPU smoke of the CUDA build)
+        run: |
+          set -eux
+          mkdir -p "$RUNNER_TEMP/cudastub"
+          ln -sf /usr/local/cuda/lib64/stubs/libcuda.so "$RUNNER_TEMP/cudastub/libcuda.so.1"
+          python3 tooling/scripts/unsloth/validate_bundle.py \
+            --bundle "dist/audio-${{ inputs.tag }}-bin-ubuntu-x64-${{ matrix.accel }}.tar.gz" \
+            --expect-backends cpu,cuda --lean-cuda '${{ matrix.major }}' --max-glibc 2.35 \
+            --lib-path "$RUNNER_TEMP/cudastub" \
+            --smoke --backend cpu --models-dir smoke-models
+
+      - name: Upload bundle artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6.0.0
+        with:
+          name: audio-${{ inputs.tag }}-bin-ubuntu-x64-${{ matrix.accel }}
+          path: dist/audio-${{ inputs.tag }}-bin-ubuntu-x64-${{ matrix.accel }}.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  windows:
+    name: windows/x64-${{ matrix.accel }}
+    runs-on: windows-2022
+    timeout-minutes: 350
+    # Gate on the environment, matching whisper.cpp: the job that can read the
+    # signing credentials is named explicitly.
+    environment: release-signing
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # CPU / Vulkan use upstream's scripts/build_windows.ps1 (MSVC, OpenMP),
+          # the recipe Etherll/audio.cpp shipped. Never the "native" CPU profile:
+          # a runner with AVX-512 would ship a binary that faults on older CPUs.
+          - { accel: cpu,          kind: script, preset: windows-cpu-release,    cpu_arch: avx2,     llamafile: 'ON',  expect: 'cpu' }
+          - { accel: cpu-portable, kind: script, preset: windows-cpu-release,    cpu_arch: baseline, llamafile: 'OFF', expect: 'cpu' }
+          - { accel: vulkan,       kind: script, preset: windows-vulkan-release, cpu_arch: avx2,     llamafile: 'ON',  expect: 'cpu,vulkan' }
+          # CUDA: direct CMake (the script asserts OpenMP, which the CUDA
+          # toolchain cannot configure), GGML_BACKEND_DL so the CUDA kernels
+          # live once in ggml-cuda.dll. The runtime DLLs ship separately.
+          - { accel: cuda12, kind: cuda, toolkit: '12.8.1', expect: 'cpu,cuda' }
+          - { accel: cuda13, kind: cuda, toolkit: '13.0.2', expect: 'cpu,cuda' }
+    defaults:
+      run: { shell: pwsh }
+    steps:
+      - name: Checkout build tooling (this repo)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+        with: { path: tooling, persist-credentials: false }
+
+      - name: Download stamped source @ ${{ inputs.tag }}
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53  # v6.0.0
+        with: { name: "${{ inputs.source_artifact }}", path: srcpkg }
+
+      - name: Extract source
+        shell: bash
+        run: |
+          set -eux
+          mkdir -p src
+          tar -xzf "srcpkg/audio.cpp-source-${{ inputs.tag }}.tar.gz" -C src --strip-components=1
+          test "$(tr -d '\r\n' < src/UNSLOTH_SOURCE_COMMIT)" = '${{ inputs.commit }}'
+
+      - name: Install Vulkan SDK
+        if: matrix.accel == 'vulkan'
+        run: |
+          curl.exe -fsSL -o "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION}.exe"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\${env:VULKAN_VERSION}"
+          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\${env:VULKAN_VERSION}\bin"
+
+      - name: Build (upstream build_windows.ps1)
+        if: matrix.kind == 'script'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $script = 'src\scripts\build_windows.ps1'
+          $text = Get-Content -Raw -LiteralPath $script
+          $extra = @()
+          if ($text -match '\[switch\]\$StaticEspeak') {
+            $extra += '-StaticEspeak'
+          } elseif ($text -notmatch 'AUDIOCPP_STATIC_ESPEAK') {
+            # Upstream's script has no eSpeak switch at this tag: add the one
+            # configure flag (what Etherll/audio.cpp's -StaticEspeak did).
+            $anchor = '"-DAUDIOCPP_DEPLOYMENT_BUILD=$deploymentBuildValue",'
+            if (-not $text.Contains($anchor)) { throw "build_windows.ps1 changed shape; cannot enable static eSpeak-ng" }
+            $text = $text.Replace($anchor, $anchor + "`n    `"-DAUDIOCPP_STATIC_ESPEAK=ON`",")
+            Set-Content -LiteralPath $script -Value $text -NoNewline -Encoding utf8
+          } else {
+            throw "build_windows.ps1 mentions AUDIOCPP_STATIC_ESPEAK without a -StaticEspeak switch; review it"
+          }
+          $ErrorActionPreference = 'Continue'
+          & $script -Preset '${{ matrix.preset }}' -Target audiocpp_server -DeploymentBuild `
+            -CpuArch '${{ matrix.cpu_arch }}' -Llamafile '${{ matrix.llamafile }}' `
+            -Version '${{ inputs.tag }}' @extra
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "BIN_DIR=$env:GITHUB_WORKSPACE\src\build\${{ matrix.preset }}\bin" | Add-Content $env:GITHUB_ENV
+          if (-not (Select-String -LiteralPath "src\build\${{ matrix.preset }}\CMakeCache.txt" -Pattern '^AUDIOCPP_STATIC_ESPEAK:BOOL=ON$' -Quiet)) { throw 'static eSpeak-ng was not enabled' }
+
+      - name: Install CUDA ${{ matrix.toolkit }}
+        if: matrix.kind == 'cuda'
+        uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d  # v0.2.36
+        with: { cuda: "${{ matrix.toolkit }}", method: local }
+
+      - name: Setup MSVC
+        if: matrix.kind == 'cuda'
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756  # v1.13.0
+        with: { arch: amd64 }
+
+      - name: Build (CUDA ${{ matrix.toolkit }})
+        if: matrix.kind == 'cuda'
+        env:
+          CUDA_ARCHS: ${{ matrix.accel == 'cuda12' && env.CUDA12_ARCHS || env.CUDA13_ARCHS }}
+        run: |
+          $want = '${{ matrix.accel == 'cuda12' && env.CUDA12_TOOLKIT || env.CUDA13_TOOLKIT }}'
+          if ($want -ne '${{ matrix.toolkit }}') { throw "matrix toolkit ${{ matrix.toolkit }} != env $want" }
+          cmake -S src -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
+            -DENGINE_ENABLE_CUDA=ON -DENGINE_ENABLE_OPENMP=OFF -DGGML_OPENMP=OFF `
+            -DENGINE_ENABLE_CUDA_GRAPHS=ON -DENGINE_ENABLE_VULKAN=OFF -DENGINE_ENABLE_METAL=OFF `
+            -DENGINE_ENABLE_LLAMAFILE=ON -DENGINE_ENABLE_NATIVE_CPU=OFF -DENGINE_BUILD_TESTS=OFF `
+            -DENGINE_ENABLE_CPU_ALL_VARIANTS=ON -DGGML_CUDA_NCCL=OFF `
+            "-DCMAKE_CUDA_ARCHITECTURES=$env:CUDA_ARCHS" `
+            "-DAUDIOCPP_VERSION=${{ inputs.tag }}" `
+            -DAUDIOCPP_STATIC_ESPEAK=ON -DAUDIOCPP_DEPLOYMENT_BUILD=ON -DAUDIOCPP_BUILD_NATIVE_MODEL_MANAGER=OFF `
+            "-DCUDAToolkit_ROOT=$env:CUDA_PATH"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build build --config Release -j $env:NUMBER_OF_PROCESSORS --target audiocpp_server
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "BIN_DIR=$env:GITHUB_WORKSPACE\build\bin" | Add-Content $env:GITHUB_ENV
+
+      # Staged outside the bin dir: the bundle stays free of the runtime DLLs,
+      # which ship as the separate cudart zip. bin\x64 is the CUDA 13 layout;
+      # robocopy's non-zero "nothing copied" codes are benign, the guard below
+      # is not.
+      - name: Collect CUDA runtime DLLs
+        if: matrix.kind == 'cuda'
+        run: |
+          $dst = "cudart"
+          New-Item -ItemType Directory -Force -Path $dst | Out-Null
+          $dlls = "cudart64_*.dll", "cublas64_*.dll", "cublasLt64_*.dll", "cufft64_*.dll"
+          robocopy "$env:CUDA_PATH\bin" $dst $dlls | Out-Null
+          robocopy "$env:CUDA_PATH\bin\x64" $dst $dlls | Out-Null
+          if (-not (Get-ChildItem -Path $dst -Filter 'cudart64_*.dll')) { Write-Error "no cudart64_*.dll under $env:CUDA_PATH"; exit 1 }
+          Get-ChildItem $dst | Select-Object Name, Length | Out-String | Write-Host
+          exit 0
+
+      # App-local MSVC runtime (and vcomp140 for the OpenMP builds) so the
+      # bundle runs on a clean Windows without the VC++ Redistributable.
+      - name: Bundle VC runtime
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -property installationPath
+          $redist = Get-ChildItem "$vs\VC\Redist\MSVC" -Directory |
+            Sort-Object { try { [version]$_.Name } catch { [version]'0.0' } } -Descending |
+            Select-Object -First 1
+          foreach ($sub in 'x64\Microsoft.VC143.CRT', 'x64\Microsoft.VC143.OPENMP') {
+            $dir = Join-Path $redist.FullName $sub
+            if (Test-Path $dir) {
+              Get-ChildItem "$dir\*.dll" | Where-Object { $_.Name -match '^(vcruntime140|msvcp140|vcomp140)' } |
+                Copy-Item -Destination $env:BIN_DIR
+            }
+          }
+          Get-ChildItem $env:BIN_DIR | Select-Object Name, Length | Out-String | Write-Host
+
+      # Before packaging, so every DLL the bundle carries is signed. Smart App
+      # Control refuses an unsigned dependent DLL as it loads.
+      - name: Sign Windows binaries
+        id: sign
+        if: inputs.sign_windows
+        uses: ./tooling/.github/actions/sign-windows
+        with:
+          path: ${{ env.BIN_DIR }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-account: ${{ secrets.AZURE_TRUSTED_SIGNING_ACCOUNT_NAME }}
+          azure-certificate-profile: ${{ secrets.AZURE_CERTIFICATE_PROFILE_NAME }}
+
+      - name: Package
+        env:
+          CUDA_ARCHS: ${{ matrix.accel == 'cuda12' && env.CUDA12_ARCHS || env.CUDA13_ARCHS }}
+        run: |
+          $pkgArgs = @('--bin-dir', $env:BIN_DIR, '--src-dir', 'src', '--out-dir', 'dist',
+            '--tag', '${{ inputs.tag }}', '--upstream-tag', '${{ inputs.upstream_tag }}',
+            '--commit', '${{ inputs.commit }}', '--source-repo', '${{ inputs.repo }}',
+            '--os', 'windows', '--arch', 'x64', '--accel', '${{ matrix.accel }}',
+            '--min-os', 'windows-10', '--espeak-commit', '${{ inputs.espeak_commit }}')
+          if ('${{ matrix.kind }}' -eq 'cuda') {
+            $pkgArgs += @('--runtime-line', '${{ matrix.accel }}', '--cuda-toolkit', '${{ matrix.toolkit }}', '--sms', $env:CUDA_ARCHS)
+          }
+          python tooling/scripts/unsloth/package_bundle.py @pkgArgs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ('${{ matrix.kind }}' -eq 'cuda') {
+            python tooling/scripts/unsloth/package_bundle.py --cudart-dir cudart --out-dir dist `
+              --tag '${{ inputs.tag }}' --arch x64 --accel '${{ matrix.accel }}'
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
+      # On the finished zip: packaging copies files in after signing, so the
+      # zip is the only thing that proves what ships.
+      - name: Verify every PE in the bundle is signed
+        if: inputs.sign_windows && steps.sign.outputs.signed == 'true'
+        run: |
+          $zips = @(Get-ChildItem dist -Filter 'audio-*-bin-*.zip' | ForEach-Object { $_.FullName })
+          if ($zips.Count -eq 0) { Write-Host '::error::no bundle in dist/'; exit 1 }
+          & tooling/.github/scripts/assert-windows-bundle-signed.ps1 -Path $zips
+          exit $LASTEXITCODE
+
+      - name: Cache smoke models
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with: { path: smoke-models, key: "${{ env.SMOKE_MODELS_KEY }}", enableCrossOsArchive: true }
+
+      # The Vulkan build imports vulkan-1.dll, which a GPU driver installs and a
+      # hosted runner may lack: use the SDK's copy when System32 has none, and
+      # fall back to the static checks (with a warning) when neither exists.
+      - name: Validate (imports, Kokoro + Moonshine smoke on the CPU backend)
+        run: |
+          $extra = @('--smoke', '--backend', 'cpu', '--models-dir', 'smoke-models')
+          if ('${{ matrix.accel }}' -eq 'vulkan' -and -not (Test-Path "$env:SystemRoot\System32\vulkan-1.dll")) {
+            $dll = Get-ChildItem 'C:\VulkanSDK' -Recurse -Filter vulkan-1.dll -ErrorAction SilentlyContinue |
+              Where-Object { $_.DirectoryName -notmatch '\\(x86|Win32|Lib32)' } | Select-Object -First 1
+            if ($dll) {
+              $extra += @('--lib-path', $dll.DirectoryName)
+            } else {
+              Write-Host '::warning::no vulkan-1.dll on this runner; Vulkan bundle gets static checks only'
+              $extra = @('--no-run')
+            }
+          }
+          python tooling/scripts/unsloth/validate_bundle.py `
+            --bundle "dist/audio-${{ inputs.tag }}-bin-windows-x64-${{ matrix.accel }}.zip" `
+            --expect-backends '${{ matrix.expect }}' @extra
+          exit $LASTEXITCODE
+
+      - name: Upload bundle artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6.0.0
+        with:
+          name: audio-${{ inputs.tag }}-bin-windows-x64-${{ matrix.accel }}
+          path: dist/audio-${{ inputs.tag }}-bin-windows-x64-${{ matrix.accel }}.zip
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload CUDA runtime artifact
+        if: matrix.kind == 'cuda'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6.0.0
+        with:
+          name: audio-${{ inputs.tag }}-cudart-windows-x64-${{ matrix.accel }}
+          path: dist/audio-${{ inputs.tag }}-cudart-windows-x64-${{ matrix.accel }}.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  macos:
+    name: macos/${{ matrix.arch }}-metal
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: arm64, runner: macos-26,       metal: 'ON',  expect: 'cpu,metal', expect_arch: arm64 }
+          # Keeps the -metal name (the installer's parser and upstream's
+          # naming), built with Metal off: Intel runners have no usable GPU and
+          # Studio launches this slice on the CPU backend.
+          - { arch: x64,   runner: macos-15-intel, metal: 'OFF', expect: 'cpu',       expect_arch: x86_64 }
+    steps:
+      - name: Checkout build tooling (this repo)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+        with: { path: tooling, persist-credentials: false }
+
+      - name: Download stamped source @ ${{ inputs.tag }}
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53  # v6.0.0
+        with: { name: "${{ inputs.source_artifact }}", path: srcpkg }
+
+      - name: Extract source
+        run: |
+          set -eux
+          mkdir -p src
+          tar -xzf "srcpkg/audio.cpp-source-${{ inputs.tag }}.tar.gz" -C src --strip-components=1
+          test "$(cat src/UNSLOTH_SOURCE_COMMIT)" = '${{ inputs.commit }}'
+
+      - name: Build
+        env:
+          AUDIOCPP_VERSION: ${{ inputs.tag }}
+          MACOS_METAL: ${{ matrix.metal }}
+          MACOS_DEPLOYMENT: '13.3'
+        run: |
+          set -eux
+          bash tooling/scripts/unsloth/build_unix.sh src build metal
+          lipo -archs build/bin/audiocpp_server | grep -qx '${{ matrix.expect_arch }}'
+
+      - name: Package
+        run: |
+          set -eux
+          python3 tooling/scripts/unsloth/package_bundle.py \
+            --bin-dir build/bin --src-dir src --out-dir dist \
+            --tag '${{ inputs.tag }}' --upstream-tag '${{ inputs.upstream_tag }}' \
+            --commit '${{ inputs.commit }}' --source-repo '${{ inputs.repo }}' \
+            --os macos --arch '${{ matrix.arch }}' --accel metal \
+            --min-os macos-13.3 --espeak-commit '${{ inputs.espeak_commit }}'
+
+      - name: Cache smoke models
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with: { path: smoke-models, key: "${{ env.SMOKE_MODELS_KEY }}", enableCrossOsArchive: true }
+
+      - name: Validate (dylib closure, Kokoro + Moonshine smoke on CPU)
+        run: |
+          set -eux
+          python3 tooling/scripts/unsloth/validate_bundle.py \
+            --bundle "dist/audio-${{ inputs.tag }}-bin-macos-${{ matrix.arch }}-metal.tar.gz" \
+            --expect-backends '${{ matrix.expect }}' --smoke --backend cpu --models-dir smoke-models
+
+      # The backend Studio actually launches on Apple Silicon. Hosted runners
+      # are VMs whose paravirtual GPU is not a product surface, so this informs
+      # rather than gates.
+      - name: Smoke on Metal (informational)
+        if: matrix.metal == 'ON'
+        continue-on-error: true
+        run: |
+          python3 tooling/scripts/unsloth/validate_bundle.py \
+            --bundle "dist/audio-${{ inputs.tag }}-bin-macos-${{ matrix.arch }}-metal.tar.gz" \
+            --expect-backends cpu,metal --smoke --backend metal --models-dir smoke-models
+
+      - name: Upload bundle artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6.0.0
+        with:
+          name: audio-${{ inputs.tag }}-bin-macos-${{ matrix.arch }}-metal
+          path: dist/audio-${{ inputs.tag }}-bin-macos-${{ matrix.arch }}-metal.tar.gz
+          if-no-files-found: error
+          retention-days: 7

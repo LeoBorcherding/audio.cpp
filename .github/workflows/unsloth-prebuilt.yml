@@ -1,0 +1,361 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+name: Unsloth audio.cpp prebuilt (full release)
+
+# One run, one release per upstream audio.cpp tag:
+#
+#   resolve   upstream_tag (0xShug0/audio.cpp) -> immutable commit SHA, stamped
+#             source tarball uploaded ONCE; every build job extracts that tree.
+#   build     unsloth-prebuilt-build.yml: Linux x64 (cpu, cpu-portable, vulkan,
+#             lean cuda12 / cuda13), Linux arm64 cpu (best-effort), Windows x64
+#             (cpu, cpu-portable, vulkan, cuda12, cuda13 + cudart zips), macOS
+#             arm64 / x64. Each bundle is validated on its own runner.
+#   assemble  Unsloth fingerprint gate, required-asset gate, manifest + sha256
+#             sidecars, then an atomic publish: draft, upload, undraft.
+#   reclaim   deletes this run's artifacts once they are release assets, or
+#             when the run published nothing.
+#
+# A tag re-point upstream cannot change what a packaging tag shipped: the SHA
+# is fixed in resolve, and a published packaging tag is never rebuilt (bump
+# packaging_suffix instead). Studio trusts only the digests pinned in its own
+# studio/audio_cpp_prebuilt_pins.json.
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: 'Upstream 0xShug0/audio.cpp tag to build'
+        default: 'v0.8.2-audio8-perf-hotfix'
+        required: true
+        type: string
+      packaging_suffix:
+        description: 'Packaging suffix: the release tag is <upstream_tag>-<suffix>'
+        default: 'unsloth.1'
+        required: true
+        type: string
+      publish:
+        description: 'Publish a GitHub Release (off = build + validate, artifacts only)'
+        default: false
+        required: false
+        type: boolean
+      sign_windows:
+        description: 'Authenticode-sign the Windows binaries (required to publish)'
+        default: true
+        required: false
+        type: boolean
+      keep_artifacts:
+        description: 'Keep this run''s artifacts even if it publishes nothing'
+        default: false
+        required: false
+        type: boolean
+
+# The default token is read-only; only assemble (contents: write) and reclaim
+# (actions: write) widen it.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.upstream_tag }}-${{ inputs.packaging_suffix }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: Resolve tag + stamp source
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    outputs:
+      upstream_tag: ${{ steps.r.outputs.upstream_tag }}
+      tag: ${{ steps.r.outputs.tag }}
+      commit: ${{ steps.r.outputs.commit }}
+      repo: ${{ steps.r.outputs.repo }}
+      source_artifact: ${{ steps.r.outputs.source_artifact }}
+      exists: ${{ steps.r.outputs.exists }}
+      espeak_commit: ${{ steps.r.outputs.espeak_commit }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      UT: ${{ inputs.upstream_tag }}
+      SUFFIX: ${{ inputs.packaging_suffix }}
+    steps:
+      - name: Checkout build tooling (this repo)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+        with: { path: tooling, persist-credentials: false }
+
+      - name: Self-test the packaging + validation scripts
+        run: python3 tooling/scripts/unsloth/test_prebuilt_scripts.py
+
+      - name: Resolve immutable commit + stamp source tree
+        id: r
+        run: |
+          set -euo pipefail
+          printf '%s' "$UT" | grep -qE '^v[0-9][A-Za-z0-9._-]*$' \
+            || { echo "refusing upstream tag '$UT' (want v<version>[-label])" >&2; exit 1; }
+          printf '%s' "$SUFFIX" | grep -qE '^[A-Za-z0-9._-]+$' \
+            || { echo "refusing packaging suffix '$SUFFIX'" >&2; exit 1; }
+          TAG="${UT}-${SUFFIX}"
+          REPO="$GITHUB_REPOSITORY"
+
+          # Annotated tags resolve to the tag object first, then its commit.
+          REF_JSON="$(gh api "repos/0xShug0/audio.cpp/git/ref/tags/${UT}")"
+          OBJ_TYPE="$(jq -r '.object.type' <<<"$REF_JSON")"
+          OBJ_SHA="$(jq -r '.object.sha' <<<"$REF_JSON")"
+          if [ "$OBJ_TYPE" = "tag" ]; then
+            COMMIT="$(gh api "repos/0xShug0/audio.cpp/git/tags/${OBJ_SHA}" --jq '.object.sha')"
+          else
+            COMMIT="$OBJ_SHA"
+          fi
+          printf '%s' "$COMMIT" | grep -qE '^[0-9a-f]{40}$' \
+            || { echo "could not resolve ${UT} to a commit" >&2; exit 1; }
+          echo "resolved ${UT} -> ${COMMIT}"
+
+          # A draft is a failed earlier run: "not published", rebuilt below.
+          EXISTS=false
+          if [ "$(gh release view "$TAG" --repo "$REPO" --json isDraft --jq .isDraft 2>/dev/null || true)" = "false" ]; then
+            EXISTS=true
+            echo "::notice::${TAG} is already published; building for artifacts only, never republishing"
+          fi
+
+          git init -q audio-src
+          git -C audio-src remote add origin https://github.com/0xShug0/audio.cpp.git
+          git -C audio-src fetch -q --depth 1 origin "$COMMIT"
+          git -C audio-src checkout -q --detach FETCH_HEAD
+          [ "$(git -C audio-src rev-parse HEAD)" = "$COMMIT" ] || { echo "fetched the wrong commit" >&2; exit 1; }
+          DATE="$(git -C audio-src show -s --format=%cs HEAD)"
+          bash tooling/scripts/unsloth/stamp_source.sh audio-src "$COMMIT" "$DATE"
+
+          # The eSpeak-ng the build fetches (tools/cmake/espeak_static.cmake),
+          # pinned to its commit for the GPL source note in every bundle.
+          ESPEAK_TAG="$(sed -nE 's|^[[:space:]]*URL[[:space:]]+https://codeload.github.com/espeak-ng/espeak-ng/tar.gz/refs/tags/([^[:space:]]+)$|\1|p' \
+            audio-src/tools/cmake/espeak_static.cmake)"
+          [ -n "$ESPEAK_TAG" ] || { echo "could not read the eSpeak-ng tag from espeak_static.cmake" >&2; exit 1; }
+          ESPEAK_COMMIT="$(git ls-remote https://github.com/espeak-ng/espeak-ng "refs/tags/${ESPEAK_TAG}^{}" | cut -f1)"
+          [ -n "$ESPEAK_COMMIT" ] || ESPEAK_COMMIT="$(git ls-remote https://github.com/espeak-ng/espeak-ng "refs/tags/${ESPEAK_TAG}" | cut -f1)"
+          printf '%s' "$ESPEAK_COMMIT" | grep -qE '^[0-9a-f]{40}$' \
+            || { echo "could not resolve eSpeak-ng ${ESPEAK_TAG} to a commit" >&2; exit 1; }
+          echo "eSpeak-ng ${ESPEAK_TAG} -> ${ESPEAK_COMMIT}"
+
+          # Submodules (the optional web frontends) are not needed for
+          # audiocpp_server and are not part of the stamped source.
+          tar -czf "${RUNNER_TEMP}/audio.cpp-source-${TAG}.tar.gz" \
+            --exclude-vcs --transform "s,^audio-src,audio.cpp-${TAG}," audio-src
+
+          {
+            echo "upstream_tag=$UT"
+            echo "tag=$TAG"
+            echo "commit=$COMMIT"
+            echo "repo=$REPO"
+            echo "source_artifact=audio-source-${TAG}"
+            echo "exists=$EXISTS"
+            echo "espeak_commit=$ESPEAK_COMMIT"
+          } >> "$GITHUB_OUTPUT"
+          echo "Resolved $UT -> $TAG ($COMMIT); release exists=$EXISTS"
+
+      - name: Upload stamped source artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6.0.0
+        with:
+          name: ${{ steps.r.outputs.source_artifact }}
+          path: ${{ runner.temp }}/audio.cpp-source-${{ steps.r.outputs.tag }}.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  build:
+    name: Build
+    needs: resolve
+    uses: ./.github/workflows/unsloth-prebuilt-build.yml
+    with:
+      tag: ${{ needs.resolve.outputs.tag }}
+      upstream_tag: ${{ needs.resolve.outputs.upstream_tag }}
+      repo: ${{ needs.resolve.outputs.repo }}
+      commit: ${{ needs.resolve.outputs.commit }}
+      source_artifact: ${{ needs.resolve.outputs.source_artifact }}
+      espeak_commit: ${{ needs.resolve.outputs.espeak_commit }}
+      sign_windows: ${{ inputs.sign_windows }}
+    # The Windows jobs Authenticode-sign with Azure Trusted Signing; declared
+    # optional in the child so a fork still builds.
+    secrets: inherit
+
+  assemble:
+    name: Assemble metadata + publish
+    needs: [resolve, build]
+    # The child's only best-effort leg (ubuntu arm64) is continue-on-error, so a
+    # green child means every required leg succeeded; the coverage gate below
+    # re-checks the required asset set by name.
+    if: >-
+      always()
+      && needs.resolve.result == 'success'
+      && needs.build.result == 'success'
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    outputs:
+      published: ${{ steps.publish.outputs.published }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.resolve.outputs.tag }}
+      UT: ${{ needs.resolve.outputs.upstream_tag }}
+      COMMIT: ${{ needs.resolve.outputs.commit }}
+      PUBLISH: ${{ inputs.publish && needs.resolve.outputs.exists != 'true' }}
+    steps:
+      - name: Checkout build tooling (this repo)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+        with: { path: tooling, persist-credentials: false }
+
+      - name: Download built bundles + stamped source
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53  # v6.0.0
+        with: { path: dist, pattern: 'audio-*', merge-multiple: true }
+
+      - name: Name the stamped source by commit too
+        run: |
+          set -eux
+          cp "dist/audio.cpp-source-${TAG}.tar.gz" "dist/audio.cpp-source-commit-${COMMIT}.tar.gz"
+          ls -la dist
+
+      # Branding gate: every bundle's BUILD_INFO.txt must open with the exact
+      # fingerprint package_bundle.py writes. Keep MARK byte-identical to
+      # FINGERPRINT there.
+      - name: Verify Unsloth fingerprint in every bundle
+        run: |
+          set -euo pipefail
+          MARK='Compiled by the Unsloth team'
+          shopt -s nullglob
+          tmp="$(mktemp -d)"; fail=0; checked=0
+          for arc in dist/audio-*-bin-*.tar.gz dist/audio-*-bin-*.zip; do
+            d="$tmp/x"; rm -rf "$d"; mkdir -p "$d"
+            case "$arc" in
+              *.zip)    unzip -qo "$arc" BUILD_INFO.txt -d "$d" || true ;;
+              *.tar.gz) tar -xzf "$arc" -C "$d" BUILD_INFO.txt || tar -xzf "$arc" -C "$d" ./BUILD_INFO.txt || true ;;
+            esac
+            if [ -f "$d/BUILD_INFO.txt" ] && [ "$(head -n1 "$d/BUILD_INFO.txt" | tr -d '\r')" = "$MARK" ]; then
+              checked=$((checked+1))
+            else
+              echo "ERROR: $(basename "$arc"): BUILD_INFO.txt does not open with the Unsloth fingerprint" >&2; fail=1
+            fi
+          done
+          rm -rf "$tmp"
+          [ "$checked" -gt 0 ] || { echo "ERROR: no bundles found to verify" >&2; exit 1; }
+          [ "$fail" = 0 ] || { echo "ERROR: refusing to publish unbranded binaries" >&2; exit 1; }
+          echo "fingerprint verified in $checked bundles"
+
+      - name: Verify required coverage
+        run: |
+          set -eu
+          fail=0
+          for f in \
+            "audio-${TAG}-bin-ubuntu-x64-cpu.tar.gz" \
+            "audio-${TAG}-bin-ubuntu-x64-cpu-portable.tar.gz" \
+            "audio-${TAG}-bin-ubuntu-x64-vulkan.tar.gz" \
+            "audio-${TAG}-bin-ubuntu-x64-cuda12.tar.gz" \
+            "audio-${TAG}-bin-ubuntu-x64-cuda13.tar.gz" \
+            "audio-${TAG}-bin-windows-x64-cpu.zip" \
+            "audio-${TAG}-bin-windows-x64-cpu-portable.zip" \
+            "audio-${TAG}-bin-windows-x64-vulkan.zip" \
+            "audio-${TAG}-bin-windows-x64-cuda12.zip" \
+            "audio-${TAG}-bin-windows-x64-cuda13.zip" \
+            "audio-${TAG}-cudart-windows-x64-cuda12.zip" \
+            "audio-${TAG}-cudart-windows-x64-cuda13.zip" \
+            "audio-${TAG}-bin-macos-arm64-metal.tar.gz" \
+            "audio-${TAG}-bin-macos-x64-metal.tar.gz" \
+            "audio.cpp-source-${TAG}.tar.gz"; do
+            [ -s "dist/$f" ] || { echo "ERROR: missing required asset $f" >&2; fail=1; }
+          done
+          [ -s "dist/audio-${TAG}-bin-ubuntu-arm64-cpu.tar.gz" ] \
+            || echo "::warning::best-effort ubuntu-arm64-cpu bundle is absent; publishing without it"
+          [ "$fail" = 0 ] || { echo "ERROR: refusing to publish an incomplete set" >&2; exit 1; }
+          echo "required coverage complete"
+
+      - name: Generate manifest + sha256 index
+        run: |
+          set -eux
+          python3 tooling/scripts/unsloth/package_bundle.py \
+            --emit-manifest --emit-sha256 --dist dist --out dist \
+            --tag "$TAG" --upstream-tag "$UT" --commit "$COMMIT" --source-repo "$GITHUB_REPOSITORY"
+          ls -la dist
+
+      # Only when the run did not succeed: a green publish already made these
+      # bytes release assets, and a rescue copy of an unverified build should
+      # not outlive a deliberate no-publish run.
+      - name: Upload full release set (artifacts)
+        if: ${{ always() && !success() }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6.0.0
+        with:
+          name: unsloth-audio-cpp-prebuilt-${{ needs.resolve.outputs.tag }}
+          path: dist/*
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 7
+
+      - name: Publish GitHub release (draft first, then atomic)
+        id: publish
+        if: ${{ env.PUBLISH == 'true' }}
+        run: |
+          set -eux
+          [ '${{ inputs.sign_windows }}' = 'true' ] \
+            || { echo "refusing to publish Windows binaries built with sign_windows=false" >&2; exit 1; }
+          REPO="$GITHUB_REPOSITORY"
+          NOTES="Automated Unsloth audio.cpp (audiocpp_server) prebuilt for upstream [0xShug0/audio.cpp ${UT}](https://github.com/0xShug0/audio.cpp/releases/tag/${UT}) at \`${COMMIT}\`. Every bundle statically links eSpeak-ng (GPL-3.0-or-later), so the binaries are distributed as a GPL-3.0-or-later combined work; see COPYING-NOTICE.txt and licenses/ inside each bundle. Linux CUDA bundles are lean: they load cudart, cuBLAS and cuFFT from the host (Unsloth Studio supplies them from PyTorch's CUDA wheels). audio-cpp-prebuilt-manifest.json and audio-cpp-prebuilt-sha256.json describe every asset."
+          # A leftover draft is a failed earlier run: replace it.
+          if [ "$(gh release view "$TAG" --repo "$REPO" --json isDraft --jq .isDraft 2>/dev/null || true)" = "true" ]; then
+            gh release delete "$TAG" --repo "$REPO" --yes --cleanup-tag
+          fi
+          gh release create "$TAG" --repo "$REPO" --draft --target "$GITHUB_SHA" \
+            --title "audio.cpp prebuilt $TAG" --notes "$NOTES" dist/*
+          gh release edit "$TAG" --repo "$REPO" --draft=false
+          [ "$(gh release view "$TAG" --repo "$REPO" --json isDraft --jq .isDraft)" = "false" ]
+          echo "published=true" >> "$GITHUB_OUTPUT"
+
+  reclaim:
+    name: Reclaim artifact storage
+    needs: [resolve, assemble]
+    # always(): a run that publishes nothing still cleans up after itself.
+    if: ${{ always() }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    permissions:
+      actions: write   # delete this run's artifacts
+      contents: read   # read the release asset list
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.resolve.outputs.tag }}
+    steps:
+      - name: Delete artifacts already published as release assets
+        if: ${{ needs.assemble.outputs.published == 'true' }}
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          repo="$GITHUB_REPOSITORY"
+          [ -n "${TAG:-}" ] || { echo "no tag resolved; leaving artifacts untouched"; exit 0; }
+          draft="$(gh release view "$TAG" --repo "$repo" --json isDraft -q .isDraft 2>/dev/null || echo missing)"
+          [ "$draft" = "false" ] || { echo "release $TAG is '$draft'; leaving artifacts untouched"; exit 0; }
+          assets="$RUNNER_TEMP/assets.txt"; arts="$RUNNER_TEMP/arts.tsv"
+          gh release view "$TAG" --repo "$repo" --json assets -q '.assets[].name' | sort > "$assets"
+          # Only THIS run's artifacts (the child is workflow_call: same run id).
+          gh api "repos/$repo/actions/runs/$GITHUB_RUN_ID/artifacts" --paginate \
+            -q '.artifacts[] | select(.expired==false) | "\(.id)\t\(.size_in_bytes)\t\(.name)"' > "$arts" || true
+          deleted=0; kept=0
+          while IFS="$(printf '\t')" read -r id _size name; do
+            [ -n "${id:-}" ] || continue
+            # Delete only what is provably on the release; -F: tags carry dots.
+            if grep -qxF -- "${name}.tar.gz" "$assets" || grep -qxF -- "${name}.zip" "$assets"; then
+              gh api -X DELETE "repos/$repo/actions/artifacts/$id" --silent < /dev/null && deleted=$((deleted+1))
+            else
+              echo "  KEEP $name (no matching release asset)"; kept=$((kept+1))
+            fi
+          done < "$arts"
+          echo "deleted $deleted artifacts, kept $kept"
+
+      - name: Delete artifacts of a run that published nothing
+        if: ${{ needs.assemble.outputs.published != 'true' && inputs.keep_artifacts != true }}
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          repo="$GITHUB_REPOSITORY"
+          arts="$RUNNER_TEMP/arts.tsv"
+          gh api "repos/$repo/actions/runs/$GITHUB_RUN_ID/artifacts" --paginate \
+            -q '.artifacts[] | select(.expired==false) | .id' > "$arts" || true
+          deleted=0
+          while read -r id; do
+            [ -n "${id:-}" ] || continue
+            gh api -X DELETE "repos/$repo/actions/artifacts/$id" --silent < /dev/null && deleted=$((deleted+1))
+          done < "$arts"
+          echo "run published nothing; deleted $deleted artifact(s)"
