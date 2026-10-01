@@ -385,7 +385,11 @@ jobs:
           if [ "$(gh release view "$TAG" --repo "$REPO" --json isDraft --jq .isDraft 2>/dev/null || true)" = "true" ]; then
             gh release delete "$TAG" --repo "$REPO" --yes --cleanup-tag
           fi
-          gh release create "$TAG" --repo "$REPO" --draft --target "$GITHUB_SHA" \
+          # No --target, as whisper.cpp: the tag goes on the default branch. GITHUB_TOKEN has
+          # no `workflows` permission, so GitHub refuses (403) a tag on a commit whose workflow
+          # files differ from the default branch, e.g. this run's SHA after a later push. The
+          # built source commit is in the notes and the stamped source tarballs.
+          gh release create "$TAG" --repo "$REPO" --draft \
             --title "audio.cpp prebuilt $TAG" --notes "$NOTES" dist/*
           gh release edit "$TAG" --repo "$REPO" --draft=false
           [ "$(gh release view "$TAG" --repo "$REPO" --json isDraft --jq .isDraft)" = "false" ]
@@ -431,8 +435,10 @@ jobs:
           done < "$arts"
           echo "deleted $deleted artifacts, kept $kept"
 
+      # Only runs that were never meant to publish. A run whose publish FAILED keeps its
+      # artifacts so "Re-run failed jobs" can publish them without a ~6h rebuild.
       - name: Delete artifacts of a run that published nothing
-        if: ${{ needs.assemble.outputs.published != 'true' && inputs.keep_artifacts != true }}
+        if: ${{ needs.assemble.outputs.published != 'true' && needs.resolve.outputs.publish != 'true' && inputs.keep_artifacts != true }}
         continue-on-error: true
         run: |
           set -euo pipefail
