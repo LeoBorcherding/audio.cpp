@@ -77,11 +77,12 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.inputs.upstream_tag || 'scheduled' }}-${{ github.event.inputs.packaging_suffix || 'auto' }}
-  # Automatic wake-ups supersede each other: they all land in one group, so a
-  # single run stuck in the runner queue would otherwise hold every later one
-  # back, and the newer run re-resolves from the API anyway. A dispatch that
-  # names a tag is someone building deliberately, and waits its turn instead.
-  cancel-in-progress: ${{ github.event_name == 'schedule' || github.event_name == 'repository_dispatch' }}
+  # Unlike whisper.cpp (whose bundles pair with llama's ggml, so a newer wake-up
+  # can mean a different build), every wake-up here resolves the same newest
+  # upstream release. A build takes ~6h and llama publishes often, so cancelling
+  # would throw away finished work; a queued wake-up instead finds the release
+  # published and exits as a no-op. GitHub keeps at most one pending run per group.
+  cancel-in-progress: false
 
 jobs:
   resolve:

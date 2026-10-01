@@ -102,10 +102,11 @@ and always sign the Windows binaries; they cannot publish unsigned. There is
 no llama.cpp pairing and no automatic `unsloth.N` roll: rebuilding a published
 upstream tag is a deliberate manual dispatch with the next suffix.
 
-Automatic runs share one concurrency group with `cancel-in-progress`, so a run
-stuck in the runner queue cannot hold back later wake-ups; a newer automatic
-run supersedes an older one and re-resolves on its own. Manual runs never
-cancel each other.
+Automatic runs share one concurrency group without `cancel-in-progress`
+(whisper.cpp cancels because a newer llama ggml can change its build; here every
+wake-up resolves the same upstream release). A wake-up arriving during a ~6h build
+waits as the single pending run, then finds the release published and exits.
+Manual runs never cancel each other.
 
 `unsloth-prebuilt-retry.yml` reruns the failed jobs of an automatic run once
 (`run_attempt == 1`) when it was cancelled with nothing failing, or failed only
