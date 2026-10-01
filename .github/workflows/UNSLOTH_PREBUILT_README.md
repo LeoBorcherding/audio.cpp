@@ -21,9 +21,12 @@ the llama.cpp install's ggml: every bundle is self-contained.
 
 ```
 .github/workflows/
-  unsloth-prebuilt.yml         orchestrator: resolve tag -> build -> gates -> publish -> reclaim
+  unsloth-prebuilt.yml         orchestrator: resolve tag -> build -> gates -> publish -> reclaim -> alert
   unsloth-prebuilt-build.yml   reusable child: every bundle, packaged + validated on its runner
+  unsloth-prebuilt-retry.yml   reruns an automatic run lost to a cancel or a dead runner, once
+  unsloth-prebuilt-deadman.yml daily: alerts when the newest aged upstream release is unpublished
 .github/actions/sign-windows/  Azure Trusted Signing of Windows PEs (same action as whisper.cpp)
+.github/actions/prebuilt-alert/ deduplicated tracking issue for pipeline health (same as whisper.cpp)
 .github/scripts/               sign-windows-tree.ps1, assert-windows-bundle-signed.ps1
 scripts/unsloth/
   stamp_source.sh              bake the resolved commit into --version for a .git-less tree
@@ -39,15 +42,21 @@ whose tag creation does not trigger upstream's `v*` tag workflow.
 
 ## Triggering a release
 
-Run **Unsloth audio.cpp prebuilt (full release)** (`workflow_dispatch`):
+Releases are normally automatic (see "Scheduling" below). To build or publish
+by hand, run **Unsloth audio.cpp prebuilt (full release)** (`workflow_dispatch`):
 
 | input | default | meaning |
 | --- | --- | --- |
-| `upstream_tag` | `v0.8.2-audio8-perf-hotfix` | 0xShug0/audio.cpp tag to build |
-| `packaging_suffix` | `unsloth.1` | release tag = `<upstream_tag>-<suffix>`, e.g. `v0.8.2-audio8-perf-hotfix-unsloth.1` |
+| `upstream_tag` | `latest` | 0xShug0/audio.cpp tag to build, or `latest` = newest aged upstream release |
+| `packaging_suffix` | (blank) | release tag = `<upstream_tag>-<suffix>`, e.g. `v0.8.2-audio8-perf-hotfix-unsloth.1`; blank = newest published `unsloth.N` of that tag, else `unsloth.1` |
+| `min_age_hours` | (blank = 6) | for `latest`: skip upstream releases public for less than this |
 | `publish` | `false` | `false` builds and validates only; `true` publishes a GitHub Release |
 | `sign_windows` | `true` | Authenticode-sign Windows binaries; publishing refuses `false` |
 | `keep_artifacts` | `false` | keep the run's artifacts even if nothing was published |
+
+An explicit tag still works exactly as before, e.g. `upstream_tag=v0.8.2-audio8-perf-hotfix`,
+`packaging_suffix=unsloth.1`. A manual dispatch of an already published tag
+builds for artifacts only and never republishes.
 
 `resolve` dereferences `upstream_tag` (annotated or lightweight) to an
 **immutable commit SHA**, fetches exactly that commit, stamps it
@@ -65,10 +74,54 @@ anonymous API the installer reads), every asset is uploaded, then it is flipped
 to `draft=false`. A leftover draft from a failed run counts as "not published"
 and is replaced on the next run. The orchestrator's default token is read-only;
 only `assemble` gets `contents: write` and only `reclaim` gets `actions: write`.
-Runs of one tag + suffix are serialised by a concurrency group.
+Manual runs of one tag + suffix are serialised by a concurrency group.
 
-There is no schedule, so whisper's retry and dead-man workflows (which exist to
-rescue unattended scheduled runs) are not needed here.
+## Scheduling, retry and dead-man
+
+The orchestrator wakes up three ways, all running the same `resolve`:
+
+- `schedule`: daily at 22:41 UTC (same slot as unslothai/whisper.cpp).
+- `repository_dispatch` of type `llama-published`, sent by unslothai/llama.cpp's
+  `unsloth-prebuilt.yml` ("Notify audio.cpp" step) after it publishes. It is
+  purely a wake-up: `client_payload` is never read. audio.cpp ships its own
+  patched ggml, so a llama release changes nothing here; it only shortens the
+  wait for a new upstream tag from up to a day to hours. llama.cpp needs the
+  `AUDIO_CPP_DISPATCH_TOKEN` secret for it (a fine-grained PAT with access to
+  unslothai/audio.cpp and **Contents: read and write**, the permission
+  `POST /repos/{owner}/{repo}/dispatches` requires); without it the step warns
+  and the daily schedule still publishes.
+- `workflow_dispatch` (above).
+
+An automatic run resolves `latest`: the newest non-draft, non-prerelease
+0xShug0/audio.cpp release whose tag looks like `v<version>[-label]` and that has
+been public for at least 6 hours. If that upstream tag already has a published
+release here at **any** `unsloth.<N>`, `exists=true` and the run is a cheap
+no-op (build, assemble and their artifacts are skipped). Otherwise it builds,
+gates and publishes `<upstream_tag>-unsloth.1`. Automatic runs always publish
+and always sign the Windows binaries; they cannot publish unsigned. There is
+no llama.cpp pairing and no automatic `unsloth.N` roll: rebuilding a published
+upstream tag is a deliberate manual dispatch with the next suffix.
+
+Automatic runs share one concurrency group with `cancel-in-progress`, so a run
+stuck in the runner queue cannot hold back later wake-ups; a newer automatic
+run supersedes an older one and re-resolves on its own. Manual runs never
+cancel each other.
+
+`unsloth-prebuilt-retry.yml` reruns the failed jobs of an automatic run once
+(`run_attempt == 1`) when it was cancelled with nothing failing, or failed only
+because a hosted runner was lost. Real build failures, hand-cancelled manual
+runs, and runs superseded by a newer automatic run are left alone.
+
+Failures are reported by the orchestrator's `alert` job and
+`unsloth-prebuilt-deadman.yml` (daily, 09:37 UTC) through
+`.github/actions/prebuilt-alert`: one deduplicated issue per key
+(`audio-cpp-prebuilt-pipeline`, `audio-cpp-prebuilt-stale`, label
+`prebuilt-failure`), commented on while failing and closed on recovery. The
+dead-man alerts when the newest aged upstream release has had no published
+`<tag>-unsloth.<N>` here for more than 36 hours after it aged (the next daily
+run plus a multi-hour build plus one retry). Issues are disabled on this
+repository today, so alerts land in the run summary with an `::error::`
+annotation until issues are enabled.
 
 ## Asset contract
 
@@ -250,8 +303,9 @@ unless every required asset (table above) exists, and writes the two sidecars.
 
 ## Runners and secrets
 
-- Only GitHub-hosted runners: `ubuntu-22.04`, `ubuntu-22.04-arm`,
-  `windows-2022`, `macos-26`, `macos-15-intel`. The Linux CUDA legs run inside
+- Only GitHub-hosted runners: `ubuntu-22.04`, `ubuntu-22.04-arm` (also
+  `resolve`, `assemble` and `alert`, which run no built binary and queue far
+  less than x64), `windows-2022`, `macos-15`, `macos-15-intel`. The Linux CUDA legs run inside
   `nvidia/cuda:<toolkit>-devel-ubuntu22.04` containers and can take several
   hours (8 CUDA targets on a 4-vCPU runner; timeout 350 minutes).
 - **Windows signing**: the Windows jobs run in the `release-signing`

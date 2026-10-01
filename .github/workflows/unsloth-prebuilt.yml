@@ -20,27 +20,47 @@ name: Unsloth audio.cpp prebuilt (full release)
 # is fixed in resolve, and a published packaging tag is never rebuilt (bump
 # packaging_suffix instead). Studio trusts only the digests pinned in its own
 # studio/audio_cpp_prebuilt_pins.json.
+#
+# Unlike whisper.cpp, nothing here pairs with a llama.cpp release: every bundle
+# carries audio.cpp's own patched ggml, so the only question an automatic run
+# asks is "is the newest aged upstream release published yet?". If any
+# <upstream_tag>-unsloth.<N> release exists the run is a no-op; otherwise it
+# builds, gates and publishes <upstream_tag>-unsloth.1 (the next free ordinal).
 
 on:
+  # Daily at 22:41 UTC, the same slot as unslothai/whisper.cpp. A run that finds
+  # the newest aged upstream release already published skips every build job.
+  schedule:
+    - cron: '41 22 * * *'
+  # Fired by unslothai/llama.cpp after it publishes. Purely a wake-up: nothing
+  # from client_payload is read, the same resolve as the schedule runs, so a
+  # stale or forged payload cannot steer the build.
+  repository_dispatch:
+    types: [llama-published]
   workflow_dispatch:
     inputs:
       upstream_tag:
-        description: 'Upstream 0xShug0/audio.cpp tag to build'
-        default: 'v0.8.2-audio8-perf-hotfix'
-        required: true
+        description: 'Upstream 0xShug0/audio.cpp tag to build, or "latest" to resolve the newest aged release'
+        default: 'latest'
+        required: false
         type: string
       packaging_suffix:
-        description: 'Packaging suffix: the release tag is <upstream_tag>-<suffix>'
-        default: 'unsloth.1'
-        required: true
+        description: 'Packaging suffix: the release tag is <upstream_tag>-<suffix> (blank = newest published unsloth.N for that tag, else unsloth.1)'
+        default: ''
+        required: false
+        type: string
+      min_age_hours:
+        description: 'For "latest": only build an upstream release public for at least this many hours (blank = 6)'
+        default: ''
+        required: false
         type: string
       publish:
-        description: 'Publish a GitHub Release (off = build + validate, artifacts only)'
+        description: 'Publish a GitHub Release (off = build + validate, artifacts only). Scheduled and dispatched runs always publish.'
         default: false
         required: false
         type: boolean
       sign_windows:
-        description: 'Authenticode-sign the Windows binaries (required to publish)'
+        description: 'Authenticode-sign the Windows binaries (required to publish; scheduled and dispatched runs always sign)'
         default: true
         required: false
         type: boolean
@@ -56,13 +76,21 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ inputs.upstream_tag }}-${{ inputs.packaging_suffix }}
-  cancel-in-progress: false
+  group: ${{ github.workflow }}-${{ github.event.inputs.upstream_tag || 'scheduled' }}-${{ github.event.inputs.packaging_suffix || 'auto' }}
+  # Automatic wake-ups supersede each other: they all land in one group, so a
+  # single run stuck in the runner queue would otherwise hold every later one
+  # back, and the newer run re-resolves from the API anyway. A dispatch that
+  # names a tag is someone building deliberately, and waits its turn instead.
+  cancel-in-progress: ${{ github.event_name == 'schedule' || github.event_name == 'repository_dispatch' }}
 
 jobs:
   resolve:
     name: Resolve tag + stamp source
-    runs-on: ubuntu-22.04
+    # arm64, like assemble and alert: these only run git, tar, gh, jq and
+    # python, nothing executes a built binary, and in unslothai/whisper.cpp +
+    # llama.cpp ubuntu-22.04-arm waited a median 2.5 min for a runner (max 38)
+    # against 10 min (p90 59) for ubuntu-22.04. resolve gates every build.
+    runs-on: ubuntu-22.04-arm
     permissions:
       contents: read
     outputs:
@@ -73,10 +101,17 @@ jobs:
       source_artifact: ${{ steps.r.outputs.source_artifact }}
       exists: ${{ steps.r.outputs.exists }}
       espeak_commit: ${{ steps.r.outputs.espeak_commit }}
+      sign_windows: ${{ steps.r.outputs.sign_windows }}
+      publish: ${{ steps.r.outputs.publish }}
     env:
       GH_TOKEN: ${{ github.token }}
-      UT: ${{ inputs.upstream_tag }}
-      SUFFIX: ${{ inputs.packaging_suffix }}
+      UT: ${{ github.event.inputs.upstream_tag || 'latest' }}
+      SUFFIX: ${{ github.event.inputs.packaging_suffix }}
+      AGE_H: ${{ github.event.inputs.min_age_hours }}
+      # Scheduled and dispatched runs always publish, and always signed.
+      AUTO: ${{ github.event_name != 'workflow_dispatch' }}
+      IN_PUBLISH: ${{ inputs.publish }}
+      IN_SIGN: ${{ inputs.sign_windows }}
     steps:
       - name: Checkout build tooling (this repo)
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
@@ -89,12 +124,44 @@ jobs:
         id: r
         run: |
           set -euo pipefail
-          printf '%s' "$UT" | grep -qE '^v[0-9][A-Za-z0-9._-]*$' \
+          SHAPE='^v[0-9][A-Za-z0-9._-]*$'
+          [ -n "$AGE_H" ] || AGE_H=6
+          printf '%s' "$AGE_H" | grep -qE '^[0-9]+$' || { echo "refusing min_age_hours '$AGE_H'" >&2; exit 1; }
+          REPO="$GITHUB_REPOSITORY"
+
+          # "latest": newest non-draft, non-prerelease upstream release public
+          # for >= AGE_H hours (a yanked tag is not shipped the minute it
+          # appears). Shape is part of the selection: old release-0.x tags do
+          # not match. List order is not guaranteed, so take max published_at.
+          if [ "$UT" = "latest" ]; then
+            CUTOFF="$(date -u -d "-${AGE_H} hours" +%s)"
+            UT="$(gh api 'repos/0xShug0/audio.cpp/releases?per_page=100' \
+              --jq "[.[] | select(.draft==false and .prerelease==false) | select(.tag_name|test(\"${SHAPE}\")) | select((.published_at|fromdateiso8601) <= ${CUTOFF})] | max_by(.published_at|fromdateiso8601) | .tag_name")"
+            if [ -z "$UT" ] || [ "$UT" = "null" ]; then
+              echo "refusing: no v<version> 0xShug0/audio.cpp release older than ${AGE_H}h in the last 100 releases" >&2
+              exit 1
+            fi
+            echo "selected upstream ${UT} (aged >= ${AGE_H}h)"
+          fi
+          printf '%s' "$UT" | grep -qE "$SHAPE" \
             || { echo "refusing upstream tag '$UT' (want v<version>[-label])" >&2; exit 1; }
+
+          # Blank suffix (every automatic run): the newest published unsloth.N
+          # of this upstream tag, so "published at any ordinal" makes exists
+          # true below; with none published, unsloth.1. Must run after UT is a
+          # concrete tag. --paginate emits one ordinal per line across pages.
+          if [ -z "$SUFFIX" ]; then
+            NEWEST_ORD="$(gh api --paginate "repos/${REPO}/releases?per_page=100" \
+              --jq ".[] | select(.draft==false) | .tag_name
+                    | select(startswith(\"${UT}-unsloth.\"))
+                    | ltrimstr(\"${UT}-unsloth.\")
+                    | select(test(\"^[0-9]+$\"))" | sort -n | tail -n 1)"
+            SUFFIX="unsloth.${NEWEST_ORD:-1}"
+            echo "no packaging suffix given; using ${SUFFIX}"
+          fi
           printf '%s' "$SUFFIX" | grep -qE '^[A-Za-z0-9._-]+$' \
             || { echo "refusing packaging suffix '$SUFFIX'" >&2; exit 1; }
           TAG="${UT}-${SUFFIX}"
-          REPO="$GITHUB_REPOSITORY"
 
           # Annotated tags resolve to the tag object first, then its commit.
           REF_JSON="$(gh api "repos/0xShug0/audio.cpp/git/ref/tags/${UT}")"
@@ -113,8 +180,18 @@ jobs:
           EXISTS=false
           if [ "$(gh release view "$TAG" --repo "$REPO" --json isDraft --jq .isDraft 2>/dev/null || true)" = "false" ]; then
             EXISTS=true
-            echo "::notice::${TAG} is already published; building for artifacts only, never republishing"
+            if [ "$AUTO" = "true" ]; then
+              echo "${TAG} is already published; nothing to do"
+            else
+              echo "::notice::${TAG} is already published; building for artifacts only, never republishing"
+            fi
           fi
+          if [ "$AUTO" = "true" ]; then
+            SIGN=true; PUBLISH=true
+          else
+            SIGN="$IN_SIGN"; PUBLISH="$IN_PUBLISH"
+          fi
+          if [ "$EXISTS" = "true" ]; then PUBLISH=false; fi
 
           git init -q audio-src
           git -C audio-src remote add origin https://github.com/0xShug0/audio.cpp.git
@@ -148,10 +225,13 @@ jobs:
             echo "source_artifact=audio-source-${TAG}"
             echo "exists=$EXISTS"
             echo "espeak_commit=$ESPEAK_COMMIT"
+            echo "sign_windows=$SIGN"
+            echo "publish=$PUBLISH"
           } >> "$GITHUB_OUTPUT"
-          echo "Resolved $UT -> $TAG ($COMMIT); release exists=$EXISTS"
+          echo "Resolved $UT -> $TAG ($COMMIT); release exists=$EXISTS; publish=$PUBLISH; sign_windows=$SIGN"
 
       - name: Upload stamped source artifact
+        if: ${{ steps.r.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6.0.0
         with:
           name: ${{ steps.r.outputs.source_artifact }}
@@ -162,6 +242,9 @@ jobs:
   build:
     name: Build
     needs: resolve
+    # An automatic run that finds the release published stops here; a manual
+    # dispatch of a published tag still builds, for artifacts only.
+    if: ${{ needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch' }}
     uses: ./.github/workflows/unsloth-prebuilt-build.yml
     with:
       tag: ${{ needs.resolve.outputs.tag }}
@@ -170,7 +253,7 @@ jobs:
       commit: ${{ needs.resolve.outputs.commit }}
       source_artifact: ${{ needs.resolve.outputs.source_artifact }}
       espeak_commit: ${{ needs.resolve.outputs.espeak_commit }}
-      sign_windows: ${{ inputs.sign_windows }}
+      sign_windows: ${{ needs.resolve.outputs.sign_windows == 'true' }}
     # The Windows jobs Authenticode-sign with Azure Trusted Signing; declared
     # optional in the child so a fork still builds.
     secrets: inherit
@@ -185,7 +268,9 @@ jobs:
       always()
       && needs.resolve.result == 'success'
       && needs.build.result == 'success'
-    runs-on: ubuntu-22.04
+      && (needs.resolve.outputs.exists != 'true' || github.event_name == 'workflow_dispatch')
+    # arm64: see resolve. Archives are only unpacked and grepped here.
+    runs-on: ubuntu-22.04-arm
     permissions:
       contents: write
     outputs:
@@ -195,7 +280,8 @@ jobs:
       TAG: ${{ needs.resolve.outputs.tag }}
       UT: ${{ needs.resolve.outputs.upstream_tag }}
       COMMIT: ${{ needs.resolve.outputs.commit }}
-      PUBLISH: ${{ inputs.publish && needs.resolve.outputs.exists != 'true' }}
+      PUBLISH: ${{ needs.resolve.outputs.publish }}
+      SIGN_WINDOWS: ${{ needs.resolve.outputs.sign_windows }}
     steps:
       - name: Checkout build tooling (this repo)
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
@@ -290,7 +376,7 @@ jobs:
         if: ${{ env.PUBLISH == 'true' }}
         run: |
           set -eux
-          [ '${{ inputs.sign_windows }}' = 'true' ] \
+          [ "$SIGN_WINDOWS" = 'true' ] \
             || { echo "refusing to publish Windows binaries built with sign_windows=false" >&2; exit 1; }
           REPO="$GITHUB_REPOSITORY"
           NOTES="Automated Unsloth audio.cpp (audiocpp_server) prebuilt for upstream [0xShug0/audio.cpp ${UT}](https://github.com/0xShug0/audio.cpp/releases/tag/${UT}) at \`${COMMIT}\`. Every bundle statically links eSpeak-ng (GPL-3.0-or-later), so the binaries are distributed as a GPL-3.0-or-later combined work; see COPYING-NOTICE.txt and licenses/ inside each bundle. Linux CUDA bundles are lean: they load cudart, cuBLAS and cuFFT from the host (Unsloth Studio supplies them from PyTorch's CUDA wheels). audio-cpp-prebuilt-manifest.json and audio-cpp-prebuilt-sha256.json describe every asset."
@@ -359,3 +445,64 @@ jobs:
             gh api -X DELETE "repos/$repo/actions/artifacts/$id" --silent < /dev/null && deleted=$((deleted+1))
           done < "$arts"
           echo "run published nothing; deleted $deleted artifact(s)"
+
+  # Covers red runs. A green run that publishes nothing is caught by
+  # unsloth-prebuilt-deadman.yml, which no failure trigger can see.
+  alert:
+    name: Report pipeline health
+    needs: [resolve, build, assemble]
+    if: ${{ always() && (github.event_name == 'schedule' || github.event_name == 'repository_dispatch' || inputs.publish) }}
+    runs-on: ubuntu-22.04-arm
+    permissions:
+      contents: read
+      issues: write
+      actions: read
+    steps:
+      - name: Checkout (for the composite action)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+        with: { persist-credentials: false }
+
+      - name: Summarise run
+        id: s
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          set -uo pipefail
+          # 'skipped' is healthy (an already-published tag skips the build);
+          # 'cancelled' is not: nothing was published.
+          FAILED="$(jq -r 'to_entries | map(select(.value.result != "success" and .value.result != "skipped") | "\(.key) (\(.value.result))") | join(", ")' <<<"$NEEDS_JSON")"
+          if [ -z "$FAILED" ]; then
+            echo "status=success" >> "$GITHUB_OUTPUT"
+            echo "details=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "status=failure" >> "$GITHUB_OUTPUT"
+          REASON="$(gh run view "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --log-failed 2>/dev/null \
+            | grep -aE 'refusing |could not |ERROR: ' \
+            | sed -E 's/^[0-9-]+T[0-9:.]+Z //' | cut -c1-300 | head -5 || true)"
+          {
+            echo 'details<<ALERT_EOF'
+            echo "**Failed jobs:** ${FAILED}"
+            if [ -n "$REASON" ]; then
+              echo
+              echo 'Reported reason:'
+              echo
+              echo '```'
+              echo "$REASON"
+              echo '```'
+            fi
+            echo
+            echo "No audio.cpp release was published. Studio keeps the prebuilt it"
+            echo "pins; the newest upstream audio.cpp release stays unpackaged."
+            echo 'ALERT_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Alert
+        uses: ./.github/actions/prebuilt-alert
+        with:
+          status: ${{ steps.s.outputs.status }}
+          key: audio-cpp-prebuilt-pipeline
+          title: 'audio.cpp prebuilt pipeline is failing'
+          details: ${{ steps.s.outputs.details }}
+          token: ${{ github.token }}

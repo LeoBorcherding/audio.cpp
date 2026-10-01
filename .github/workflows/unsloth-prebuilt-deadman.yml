@@ -1,0 +1,110 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+name: Unsloth audio.cpp prebuilt dead-man check
+
+# The worst failure mode is a green run, not a red one: a schedule that never
+# fires, a llama.cpp wake-up that never arrives, or a resolve that decides
+# there is nothing to do. Nothing keyed off job failure can see any of those.
+#
+# It asks the question the orchestrator's resolve asks, from the outside: has
+# the newest aged upstream 0xShug0/audio.cpp release been published here at
+# any <tag>-unsloth.<N>? Once that release has been aged for longer than
+# PUBLISH_GRACE_HOURS with no such release, the pipeline is broken.
+
+on:
+  schedule:
+    - cron: '37 9 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  # Must match the orchestrator's default min_age_hours.
+  MIN_AGE_HOURS: '6'
+  # How long an aged release may stay unpublished before that counts as a
+  # fault rather than a build in progress: up to 24h until the next daily
+  # cron, plus a multi-hour build (the Linux CUDA legs alone can take ~6h),
+  # plus one retry.
+  PUBLISH_GRACE_HOURS: '36'
+
+jobs:
+  deadman:
+    name: Check publish freshness
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout (for the composite action)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+        with: { persist-credentials: false }
+
+      - name: Check the newest aged upstream release is published
+        id: c
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          SHAPE='^v[0-9][A-Za-z0-9._-]*$'
+          NOW="$(date -u +%s)"
+          CUTOFF=$(( NOW - MIN_AGE_HOURS * 3600 ))
+          # Same selection as the orchestrator's resolve for "latest".
+          UP="$(gh api 'repos/0xShug0/audio.cpp/releases?per_page=100' \
+            --jq "[.[] | select(.draft==false and .prerelease==false) | select(.tag_name|test(\"${SHAPE}\")) | select((.published_at|fromdateiso8601) <= ${CUTOFF})]
+                  | max_by(.published_at|fromdateiso8601) | \"\(.tag_name)\t\(.published_at)\"" 2>/dev/null || true)"
+          if [ -z "$UP" ] || [ "$UP" = "null" ]; then
+            echo "::warning::could not read an aged upstream release; skipping this check"
+            echo "status=skip" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          UT="${UP%%$'\t'*}"
+          UPUB="${UP##*$'\t'}"
+
+          # Fail open on an unreadable list: no alert on a guess.
+          if ! OURS="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+                 --jq ".[] | select(.draft==false) | .tag_name | select(startswith(\"${UT}-unsloth.\"))")"; then
+            echo "::warning::could not read this repository's releases; skipping this check"
+            echo "status=skip" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ -n "$OURS" ]; then
+            echo "upstream ${UT} is published as: $(tr '\n' ' ' <<<"$OURS")"
+            echo "status=success" >> "$GITHUB_OUTPUT"
+            echo "details=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          AGED_H=$(( ( NOW - $(date -u -d "$UPUB" +%s) ) / 3600 - MIN_AGE_HOURS ))
+          if [ "$AGED_H" -le "$PUBLISH_GRACE_HOURS" ]; then
+            echo "upstream ${UT} unpublished, but aged only ${AGED_H}h; within the ${PUBLISH_GRACE_HOURS}h window"
+            echo "status=success" >> "$GITHUB_OUTPUT"
+            echo "details=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          NEWEST="$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=30" \
+            --jq '[.[] | select(.draft==false)] | max_by(.published_at|fromdateiso8601) // empty
+                  | "\(.tag_name), published \(.published_at)"' 2>/dev/null || true)"
+          echo "status=failure" >> "$GITHUB_OUTPUT"
+          {
+            echo 'details<<ALERT_EOF'
+            echo "Upstream audio.cpp \`${UT}\` has been eligible for **${AGED_H}h** (threshold ${PUBLISH_GRACE_HOURS}h) and no \`${UT}-unsloth.<N>\` release exists here."
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| newest aged upstream release | \`${UT}\`, published ${UPUB} |"
+            echo "| newest release here | ${NEWEST:-none} |"
+            echo
+            echo "Check whether the scheduled run fired, whether llama.cpp's notify step reached this repo, and the last run of \`Unsloth audio.cpp prebuilt (full release)\`."
+            echo 'ALERT_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Alert
+        if: ${{ steps.c.outputs.status != 'skip' }}
+        uses: ./.github/actions/prebuilt-alert
+        with:
+          status: ${{ steps.c.outputs.status }}
+          key: audio-cpp-prebuilt-stale
+          title: 'audio.cpp prebuilts are out of date'
+          details: ${{ steps.c.outputs.details }}
+          token: ${{ github.token }}
