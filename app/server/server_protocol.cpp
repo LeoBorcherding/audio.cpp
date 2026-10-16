@@ -931,6 +931,21 @@ speaker_turns_json(const std::vector<engine::runtime::SpeakerTurn> &turns) {
   return out.str();
 }
 
+// Live and file-backed streaming routes drop VAD output on the floor; this is
+// the per-segment event they emit so a client gets speech bounds as they land.
+std::string speech_segment_event_json(
+    const engine::runtime::VoiceActivityEvent &event, int sample_rate) {
+  std::ostringstream out;
+  out << "{\"type\":\"transcript.speech_segment\"";
+  if (event.segment) {
+    out << ",\"start_sample\":" << event.segment->span.start_sample
+        << ",\"end_sample\":" << event.segment->span.end_sample
+        << ",\"confidence\":" << event.segment->confidence;
+  }
+  out << ",\"sample_rate\":" << sample_rate << "}";
+  return out.str();
+}
+
 std::string
 diarization_event_json(const std::vector<engine::runtime::SpeakerTurn> &turns,
                        int sample_rate, bool final,

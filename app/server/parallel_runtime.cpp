@@ -2030,6 +2030,11 @@ HttpResponse ParallelServerState::handle_transcription_live(const HttpRequest & 
                 task_request,
                 audio,
                 [&](const engine::runtime::StreamEvent & event) {
+                    for (const auto & activity : event.voice_activity) {
+                        if (activity.kind == engine::runtime::VoiceActivityEvent::Kind::SpeechSegment) {
+                            write_sse(writer, speech_segment_event_json(activity, sample_rate));
+                        }
+                    }
                     if (diarization) {
                         if (!event.speaker_turns.empty()) {
                             write_sse(writer, diarization_event_json(event.speaker_turns, sample_rate, false));
@@ -2059,13 +2064,15 @@ HttpResponse ParallelServerState::handle_transcription_live(const HttpRequest & 
             if (!timed_result.result.text_output.has_value()) {
                 throw std::runtime_error("live transcription result did not contain transcript text");
             }
-            write_sse(
-                writer,
-                "{\"type\":\"transcript.text.done\",\"text\":" +
-                    json_quote(timed_result.result.text_output->text) +
-                    ",\"timing\":" +
-                    ttft_timing_json(require_ttft_ms(timed_result.ttft_ms)) +
-                    "}");
+            std::ostringstream done;
+            done << "{\"type\":\"transcript.text.done\",\"text\":"
+                 << json_quote(timed_result.result.text_output->text);
+            write_transcript_detail_fields(done, timed_result.result);
+            if (!timed_result.result.speech_segments.empty()) {
+                done << ",\"sample_rate\":" << sample_rate;
+            }
+            done << ",\"timing\":" << ttft_timing_json(require_ttft_ms(timed_result.ttft_ms)) << "}";
+            write_sse(writer, done.str());
             write_sse_done(writer);
         });
 }

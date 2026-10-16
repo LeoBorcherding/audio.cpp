@@ -112,6 +112,9 @@ double require_ttft_ms(const std::optional<double> &ttft_ms);
 double require_input_end_ms(const std::optional<double> &input_end_ms);
 std::unordered_map<std::string, std::string>
 timing_headers(double wall_ms, const engine::runtime::AudioBuffer &audio);
+std::string speech_segment_event_json(
+    const engine::runtime::VoiceActivityEvent &event, int sample_rate);
+
 std::string
 diarization_event_json(const std::vector<engine::runtime::SpeakerTurn> &turns,
                        int sample_rate, bool final,
