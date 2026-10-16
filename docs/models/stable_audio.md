@@ -2,6 +2,23 @@
 
 Stable Audio is wired as `--family stable_audio --task gen`. It generates music or sound effects from text, and the music model can condition generation on input audio for init-audio or inpainting workflows.
 
+## Stable Audio 3 Medium
+
+Use the medium package for the larger Stable Audio 3 music model. It uses the same user-facing controls as the music path.
+
+| Field | Value |
+|---|---|
+| Family | `stable_audio` |
+| Model directory | `models/stable-audio-3-medium` |
+| Task | `gen` |
+| Main mode | Text-to-music |
+| Prompt language | `en` |
+| Optional audio input | Supported by the Stable Audio request path when the model package provides the needed components |
+
+```bash
+audiocpp_cli --task gen --family stable_audio --model models/stable-audio-3-medium --backend cuda --text "wide cinematic ambient music with soft piano and evolving strings" --duration-seconds 30 --out music_medium.wav
+```
+
 ## Stable Audio 3 Small Music
 
 This is the default music-generation package. Use it for text-to-music, init-audio, and inpainting.
@@ -50,22 +67,24 @@ Use this package for short sound effects. It uses the same `gen` task but is int
 audiocpp_cli --task gen --family stable_audio --model models/stable-audio-3-small-sfx --backend cuda --text "footsteps on gravel, close perspective, crisp natural stone texture" --duration-seconds 8 --out sfx.wav
 ```
 
-## Stable Audio 3 Medium
+## Stable Audio Foundation / Open v1
 
-Use the medium package for the larger Stable Audio 3 music model. It uses the same user-facing controls as the music path.
+The same family also loads Foundation checkpoints using the Stable Audio Open v1
+layout. Use `--task gen --mode offline` with the Foundation checkpoint path; the
+Stable Audio 3 packages above use a separate runtime path.
 
-| Field | Value |
-|---|---|
-| Family | `stable_audio` |
-| Model directory | `models/stable-audio-3-medium` |
-| Task | `gen` |
-| Main mode | Text-to-music |
-| Prompt language | `en` |
-| Optional audio input | Supported by the Stable Audio request path when the model package provides the needed components |
+Foundation accepts these additional request options through
+`--request-option key=value`:
 
-```bash
-audiocpp_cli --task gen --family stable_audio --model models/stable-audio-3-medium --backend cuda --text "wide cinematic ambient music with soft piano and evolving strings" --duration-seconds 30 --out music_medium.wav
-```
+| Option | Values | Default | Meaning |
+|---|---|---:|---|
+| `sampler_mode` | `pingpong`, `euler`, `dpmpp-2m`, `dpmpp-3m-sde` | not set | Foundation sampler; legacy `sampler` remains accepted. |
+| `sigma_min` | float > 0 | `0.01` | Minimum noise level for the DPM++ samplers. |
+| `sigma_max` | float > `sigma_min` | `100` | Maximum noise level for the DPM++ samplers; init audio uses `init_noise_level` instead. |
+| `rho` | float > 0 | `1` | Noise-schedule parameter for the DPM++ samplers. |
+
+The following common/request tables describe Stable Audio 3. Foundation also
+accepts the shared request controls, with duration capped by its checkpoint limit.
 
 ## Common Options (use directly)
 
@@ -82,22 +101,32 @@ audiocpp_cli --task gen --family stable_audio --model models/stable-audio-3-medi
 
 | Option | Values | Default | Meaning |
 |---|---|---:|---|
-| `negative_prompt` | text | empty string | Negative prompt. |
-| `sampler` | `pingpong`, `euler`, `dpmpp-2m`, `dpmpp-3m-sde` | `pingpong` | Diffusion sampler for Stable Audio 3. The foundation/medium path also accepts the DPM++ samplers. |
-| `apg_scale` | float | `1.0` | Adaptive projected guidance scale. |
+| `prompt` | text | not set | Fallback text prompt when text_input is absent; pipe separates batch prompts. |
+| `negative_prompt` | text | not set | Negative prompt. |
+| `duration_sec` | seconds or comma-separated seconds | `120` | Target duration per batch prompt; encode multiple durations as a comma-separated string, not a JSON array. |
 | `batch_size` | integer | `1` | Prompt batch size. |
-| `duration_padding_seconds` | seconds | `6.0` | Extra generated padding before truncation. |
+| `num_inference_steps` | integer >= 1 | `8` | Diffusion steps. |
+| `guidance_scale` | float | `1` | Classifier-free guidance scale. |
+| `apg_scale` | float | `1` | Adaptive projected guidance scale. |
+| `sampler_mode` | `pingpong`, `euler` | not set | Stable Audio 3 diffusion sampler. Legacy `sampler` remains accepted. |
+| `seed` | integer >= 0 | random | Sampling seed; omitted chooses a random seed. |
+| `duration_padding_sec` | seconds | `6` | Extra generated padding before truncation. |
 | `truncate_output_to_duration` | bool | `true` | Trim decoded audio to requested duration. |
 | `chunked_decode` | bool | `true` | Decode the autoencoder in chunks. |
-| `audio_input_kind` | `init_audio`, `inpaint_audio` | `init_audio` when `--audio` is provided | How the model uses input audio. |
-| `init_noise_level` | `0..1` | `1.0` | Strength for audio-conditioned generation. |
-| `inpaint_mask_start_seconds` | comma-separated seconds | not set | Inpaint region start times. |
-| `inpaint_mask_end_seconds` | comma-separated seconds | not set | Inpaint region end times. |
+| `init_noise_level` | `[0, 1]` | `1` | Strength for audio-conditioned generation. |
+| `audio_input_kind` | `init_audio`, `inpaint_audio` | `init_audio` | How the model uses input audio. |
+| `inpaint_mask_start_sec` | comma-separated seconds | not set | Inpaint region start times. |
+| `inpaint_mask_end_sec` | comma-separated seconds | not set | Inpaint region end times. |
+
+The corresponding legacy `*_seconds` request names remain accepted. Use only
+one name for each control in a request.
 
 ## Session Options (use with `--session-option`)
 
 | Option | Values | Default | Meaning |
 |---|---|---:|---|
+| `stable_audio.max_batch` | integer >= 1 | `1` | Maximum prompt batch size. |
+| `stable_audio.weight_type` | `native`, `f32`, `f16`, `bf16`, `q8_0` | not set | Weight storage type; defaults to native. |
 | `stable_audio.mem_saver` | bool | `false` | Release staged graph/cache state after conditioner, diffusion, and autoencoder phases to reduce resident VRAM. Later requests may rebuild released graphs. |
 
 For backend weight-type controls, use `audiocpp_cli --inspect --model <model-dir> --family stable_audio`.

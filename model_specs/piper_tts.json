@@ -59,7 +59,8 @@
         "description": "Non-negative generation seed.",
         "required": false,
         "min": 0,
-        "default": 1234
+        "default": 1234,
+        "max": 4294967295
       },
       {
         "name": "text_chunk_mode",
@@ -95,6 +96,13 @@
         "type": "path",
         "description": "Optional explicit path to espeak-ng-data.",
         "required": false
+      },
+      {
+        "name": "exec_plan",
+        "type": "string",
+        "description": "JSON object of component execution plans. Component: decoder. Each plan accepts impl, backend, artifacts, and params. impl is default/ggml/rknn. Default keeps existing execution. GGML supports the session backend; RKNN requires artifacts.main and ENGINE_ENABLE_RKNN, with no backend field. Neither implementation takes params.",
+        "required": false,
+        "default": "{}"
       }
     ],
     "load": []
@@ -130,7 +138,7 @@
     ],
     "docs": [
       "docs/tts.md",
-      "docs/community_models/piper_tts.md",
+      "docs/models/piper_tts.md",
       "docs/gguf.md"
     ]
   },

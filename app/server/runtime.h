@@ -4,6 +4,7 @@
 #include "config.h"
 #include "frontend.h"
 #include "http.h"
+#include "server_protocol.h"
 #if defined(AUDIOCPP_HAS_NATIVE_MODEL_MANAGER)
 #include "model_installer.h"
 #endif
@@ -49,13 +50,9 @@ public:
     LiveIngestLimits live_ingest_limits(const HttpRequest & request) const override;
 
 private:
-    struct LoadedModel {
-        struct RuntimeVoicePreset {
-            std::optional<std::string> voice_id;
-            std::optional<engine::runtime::AudioBuffer> audio;
-            std::optional<std::string> reference_text;
-        };
+    friend struct RequestDispatcher;
 
+    struct LoadedModel {
         ServerModelConfig config;
         engine::runtime::TaskSpec task;
         std::unique_ptr<engine::runtime::ILoadedVoiceModel> model;
@@ -83,6 +80,10 @@ private:
         bool accepts_language = true;
         bool accepts_speed = true;
         bool accepts_speaking_rate = true;
+        // The spec's request options as a JSON array, served by
+        // `GET /v1/models?include_params=true`. Resolved at registration for the
+        // same cost reason as the flags above; "[]" when the spec declares none.
+        std::string request_params_json = "[]";
         // Serializes runs on this model and bounds how long a caller waits for its
         // turn; see BusyGuard.
         BusyGuard busy;
@@ -107,6 +108,7 @@ private:
     // Recompute the per-model, config-derived request-option flags (currently
     // accepts_reference_text). Called at registration and on reconfiguration.
     void refresh_model_option_flags(LoadedModel & model);
+    HttpResponse handle_health() const;
     std::filesystem::path resolve_ui_model_path(const std::filesystem::path & path) const;
     HttpResponse handle_model_load(const std::string & body_text);
     HttpResponse handle_model_unload(const std::string & body_text);
@@ -125,7 +127,7 @@ private:
 #endif
     HttpResponse handle_ui_asset() const;
     HttpResponse handle_ui_voice_preview(const HttpRequest & request) const;
-    LoadedModel::RuntimeVoicePreset load_runtime_voice_preset(const ServerModelConfig::VoicePreset & preset) const;
+    RuntimeVoicePreset load_runtime_voice_preset(const ServerModelConfig::VoicePreset & preset) const;
     void load_voice_presets(LoadedModel & model) const;
     void ensure_model_loaded_locked(LoadedModel & model);
     // With max_loaded_models set, unload least recently used idle models until
@@ -137,16 +139,9 @@ private:
     // memory and (for GPU backends) the backend device memory.
     void ensure_model_fits_memory(const ServerModelConfig & model);
     LoadedModel & require_model(const engine::io::json::Value & body);
-    const LoadedModel::RuntimeVoicePreset * select_voice_preset(
-        const LoadedModel & model,
-        const engine::io::json::Value & body,
-        bool & voice_field_is_preset) const;
     engine::runtime::TaskRequest build_speech_request(
         const LoadedModel & model,
         const engine::io::json::Value & body) const;
-    engine::runtime::TaskRequest apply_default_request_options(
-        const LoadedModel & model,
-        engine::runtime::TaskRequest request) const;
     struct TimedTaskResult;
     // `busy_timeout_ms` on each of these is the per-request override parsed from the
     // request body; nullopt means "use the model's configured ceiling".
@@ -206,6 +201,7 @@ private:
         std::optional<int> busy_timeout_ms = std::nullopt);
     HttpResponse handle_transcription_live(const HttpRequest & request);
     HttpResponse handle_generic_run(const std::string & body_text);
+    HttpResponse handle_generic_batch(const std::string & body_text);
     HttpResponse handle_generic_stream(const std::string & body_text);
     HttpResponse handle_voices(const HttpRequest & request) const;
     HttpResponse handle_unload_models(const std::string & body_text);
@@ -214,7 +210,7 @@ private:
     // that long without a model load/run, unloads every resident (non-busy) model.
     void idle_unload_loop();
     void unload_idle_models();
-    std::string models_json(bool include_session_options = false) const;
+    std::string models_json(bool include_session_options = false, bool include_params = false) const;
     std::string get_allowed_origin(const HttpRequest & request) const;
 
     ServerConfig config_;

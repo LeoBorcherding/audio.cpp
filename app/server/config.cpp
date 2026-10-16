@@ -12,6 +12,12 @@
 #include <utility>
 
 namespace minitts::server {
+
+// The request reader caps the artifact payloads of one request at the default
+// body limit, so the two have to move together.
+static_assert(minitts::cli::kMaxRequestArtifactBytes == kDefaultMaxRequestBodyBytes,
+              "request artifact payload limit differs from the default request body limit");
+
 namespace {
 
 std::filesystem::path resolve_path(const std::filesystem::path & base, const std::filesystem::path & path) {
@@ -217,6 +223,10 @@ engine::core::BackendType parse_server_backend(const std::string & value) {
 }
 
 ServerConfig load_server_config(const std::filesystem::path & path) {
+    return load_server_config(path, false);
+}
+
+ServerConfig load_server_config(const std::filesystem::path & path, bool parallel_jobs) {
     const auto root = engine::io::json::parse_file(path);
     const auto base = path.parent_path();
     ServerConfig config;
@@ -241,7 +251,9 @@ ServerConfig load_server_config(const std::filesystem::path & path) {
         config.live_ingest = parse_live_ingest_limits(*value, config.live_ingest, "server live_ingest");
     }
     if (const auto * value = root.find("model_spec_override")) {
-        config.model_spec_override = resolve_path(base, value->as_string());
+        const auto & selection = value->as_string();
+        config.model_spec_override = selection == "embedded"
+            ? std::filesystem::path(selection) : resolve_path(base, selection);
     }
     if (const auto * value = root.find("voice_dir")) {
         if (!value->is_string()) {
@@ -297,11 +309,26 @@ ServerConfig load_server_config(const std::filesystem::path & path) {
         const auto raw_path = engine::io::json::require_string(item, "path");
         model.path = resolve_path(base, raw_path);
         if (const auto * value = item.find("model_spec_override")) {
-            model.model_spec_override = resolve_path(base, value->as_string());
+            const auto & selection = value->as_string();
+            model.model_spec_override = selection == "embedded"
+                ? std::filesystem::path(selection) : resolve_path(base, selection);
         }
         model.task = engine::io::json::optional_string(item, "task", model.task);
         model.mode = engine::io::json::optional_string(item, "mode", model.mode);
         model.lazy = engine::io::json::optional_bool(item, "lazy", config.lazy_load);
+        if (!parallel_jobs && item.find("slots") != nullptr) {
+            throw std::runtime_error("slots requires --parallel-jobs at server startup");
+        }
+        if (parallel_jobs) {
+            if (const auto * value = item.find("slots")) {
+                if (!value->is_number() || !std::isfinite(value->as_number()) ||
+                    std::floor(value->as_number()) != value->as_number() ||
+                    value->as_number() < 1 || value->as_number() > 16) {
+                    throw std::runtime_error("model slots must be an integer between 1 and 16");
+                }
+                model.slots = static_cast<int>(value->as_number());
+            }
+        }
         if (item.find("busy_timeout_ms") != nullptr) {
             const auto busy_timeout_ms = engine::io::json::optional_i32(item, "busy_timeout_ms", 0);
             if (busy_timeout_ms < 0) {

@@ -87,6 +87,24 @@ void test_inline_default_and_named_presets() {
     require(model.voice_presets.at("builtin").voice_id == "alba", "named voice_id parsed");
 }
 
+void test_model_spec_override_selection() {
+    const auto root = make_temp_root();
+    const auto path = write_config(root, "spec-override.json", R"JSON({
+      "model_spec_override": "embedded",
+      "models": [
+        {"id": "embedded", "family": "kokoro_tts", "path": "model.gguf", "model_spec_override": "embedded"},
+        {"id": "file", "family": "kokoro_tts", "path": "model.gguf", "model_spec_override": "specs/kokoro_tts.json"},
+        {"id": "literal", "family": "kokoro_tts", "path": "model.gguf", "model_spec_override": "./embedded"}
+      ]
+    })JSON");
+    const auto config = minitts::server::load_server_config(path);
+    require(config.model_spec_override == std::filesystem::path("embedded"), "global embedded selector stays literal");
+    require(config.models[0].model_spec_override == std::filesystem::path("embedded"), "per-model embedded selector stays literal");
+    require(config.models[1].model_spec_override == root / "specs/kokoro_tts.json", "spec file still resolves relative to config");
+    require(config.models[2].model_spec_override == (root / "./embedded"), "literal embedded path stays a path");
+    std::filesystem::remove_all(root);
+}
+
 void test_builtin_utility_model_paths() {
     const auto root = make_temp_root();
     const auto absolute = (root / "weights" / "rnnoise.safetensors").generic_string();
@@ -625,11 +643,40 @@ void test_model_memory_estimator() {
     }
 }
 
+void test_model_slots() {
+    const auto root = make_temp_root();
+    for (const std::string value : {"1", "2", "16", "0", "-1", "17", "null", "true", "\"2\"", "1.5", "4294967297"}) {
+        const auto text = std::string(R"({"models":[{"id":"higgs","family":"higgs_audio_tts","path":"model.gguf","slots":)")
+            + value + "}]}";
+        const auto path = write_config(root, "slots.json", text);
+        bool legacy_rejected = false;
+        try { (void)minitts::server::load_server_config(path); }
+        catch (const std::runtime_error & error) {
+            legacy_rejected = std::string(error.what()).find("slots requires --parallel-jobs") != std::string::npos;
+        }
+        require(legacy_rejected, "legacy configuration accepted an explicit slots field");
+        bool rejected = false;
+        try {
+            const auto config = minitts::server::load_server_config(path, true);
+            require(config.models.front().slots == std::stoi(value), "slots value was not preserved");
+        } catch (const std::runtime_error &) { rejected = true; }
+        require(rejected == (value != "1" && value != "2" && value != "16"), "parallel capacity validation differs");
+    }
+    const auto path = write_config(root, "default-slots.json",
+        R"({"models":[{"id":"higgs","family":"higgs_audio_tts","path":"model.gguf"}]})");
+    for (bool enabled : {false, true}) {
+        const auto config = minitts::server::load_server_config(path, enabled);
+        require(config.models.front().slots == 1, "default capacity must remain one");
+    }
+}
+
 }  // namespace
 
 int main() {
     try {
+        test_model_slots();
         test_inline_default_and_named_presets();
+        test_model_spec_override_selection();
         test_builtin_utility_model_paths();
         test_default_preset_name();
         test_default_request_options();
