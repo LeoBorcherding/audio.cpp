@@ -161,6 +161,8 @@ Each release also carries `audio-cpp-prebuilt-manifest.json`,
 - eSpeak-ng linked statically, with `espeak-ng-data.bin` beside the server
   (Studio's eSpeak check looks for it there). Kokoro, KittenTTS, Piper and
   Inflect need it.
+- `assets/framework/models/` beside the server: the in-tree Silero and MarbleNet
+  VAD weights the ASR families load from that cwd-relative path.
 - Model specs compiled in (`AUDIOCPP_DEPLOYMENT_BUILD=ON`); the native model
   manager is off (`AUDIOCPP_BUILD_NATIVE_MODEL_MANAGER=OFF`): Studio downloads
   models itself, so the server carries no TLS stack and needs no host

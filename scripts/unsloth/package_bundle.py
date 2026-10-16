@@ -161,8 +161,11 @@ def _copy(bin_dir: Path, stage: Path, name: str, symlinks: bool) -> None:
         shutil.copy2(src, dst, follow_symlinks=True)
 
 
-def curate(os_name: str, bin_dir: Path, stage: Path) -> list[str]:
-    """Copy the server, its local library closure and the eSpeak data into stage."""
+VAD_ASSETS = Path("assets") / "framework" / "models"
+
+
+def curate(os_name: str, bin_dir: Path, stage: Path, src_dir: Path | None = None) -> list[str]:
+    """Copy the server, its local library closure, the eSpeak data and the bundled VAD models into stage."""
     server = _server_name(os_name)
     if not (bin_dir / server).is_file():
         die(f"missing {bin_dir / server}")
@@ -170,6 +173,12 @@ def curate(os_name: str, bin_dir: Path, stage: Path) -> list[str]:
         die(f"missing {bin_dir / ESPEAK_DATA}: every Unsloth bundle links eSpeak-ng statically")
     shutil.copy2(bin_dir / server, stage / server)
     shutil.copy2(bin_dir / ESPEAK_DATA, stage / ESPEAK_DATA)
+    if src_dir is not None:
+        # Silero and MarbleNet ship in-tree and the ASR families look them up at
+        # assets/framework/models/<name> relative to the cwd, so they ride beside the server.
+        if not (src_dir / VAD_ASSETS / "silero_vad").is_dir():
+            die(f"missing {src_dir / VAD_ASSETS / 'silero_vad'}")
+        shutil.copytree(src_dir / VAD_ASSETS, stage / VAD_ASSETS)
 
     if os_name == "linux":
         # Dynamically linked ggml (cpu-portable) plus its dlopen'd CPU variant
@@ -414,7 +423,7 @@ def do_package(a: argparse.Namespace) -> int:
 
     stage = Path(tempfile.mkdtemp(prefix="acpp-stage-"))
     try:
-        files = curate(cfg["os"], bin_dir, stage)
+        files = curate(cfg["os"], bin_dir, stage, Path(cfg["src_dir"]))
         write_licenses(stage, cfg, espeak)
         if not a.no_run:
             cfg["server_version"] = _server_version(stage, cfg["os"])

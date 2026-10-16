@@ -114,7 +114,9 @@ def check_layout(root: Path, server: Path, asset: str | None) -> dict:
         ok(f"espeak-ng-data.bin beside the server ({data.stat().st_size} bytes)")
     else:
         fail("espeak-ng-data.bin missing beside the server (Studio's eSpeak check fails)")
-    for rel in ("LICENSE", "COPYING-NOTICE.txt", "licenses/espeak-ng/COPYING", "licenses/espeak-ng/SOURCE.txt"):
+    for rel in ("LICENSE", "COPYING-NOTICE.txt", "licenses/espeak-ng/COPYING", "licenses/espeak-ng/SOURCE.txt",
+                "assets/framework/models/silero_vad/silero_vad_16k.safetensors",
+                "assets/framework/models/marblenet_vad/marblenet_vad.safetensors"):
         (ok if (root / rel).is_file() else fail)(f"{rel} {'present' if (root / rel).is_file() else 'missing'}")
     bi = root / "BUILD_INFO.txt"
     first = bi.read_text(encoding="utf-8").splitlines()[0] if bi.is_file() else ""
